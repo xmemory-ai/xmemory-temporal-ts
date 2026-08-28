@@ -1,0 +1,70 @@
+{
+  "name": "@xmemory/temporal",
+  "version": "0.1.0",
+  "description": "Temporal plugin for xmemory \u2014 durable agent memory as Temporal Activities",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xmemory-ai/xmemory-temporal-ts.git"
+  },
+  "homepage": "https://github.com/xmemory-ai/xmemory-temporal-ts#readme",
+  "bugs": {
+    "url": "https://github.com/xmemory-ai/xmemory-temporal-ts/issues"
+  },
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./workflow": {
+      "types": "./dist/workflow.d.ts",
+      "default": "./dist/workflow.js"
+    }
+  },
+  "//sideEffects": "No module has import-time side effects, so a bundler can drop what a consumer does not use. Workflow code imports @xmemory/temporal/workflow, a leaf that reaches no Activity or client code.",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12"
+  },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
+  "//pin": "The @temporalio worker plugin surface is experimental; pin to the 1.20.x line (~) rather than allowing 1.x minors, so a plugin-API change cannot land unreviewed.",
+  "dependencies": {
+    "xmemory": "^3.8.3"
+  },
+  "devDependencies": {
+    "@temporalio/activity": "~1.20.0",
+    "@temporalio/client": "~1.20.0",
+    "@temporalio/common": "~1.20.0",
+    "@temporalio/testing": "~1.20.0",
+    "@temporalio/worker": "~1.20.0",
+    "@temporalio/workflow": "~1.20.0",
+    "@types/ms": "^2.1.0",
+    "@types/node": "^22",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc --noEmit -p tsconfig.test.json && node --import tsx --test test/*.test.ts",
+    "check:bundle": "node --import tsx scripts/check-workflow-bundle.ts",
+    "check:declarations": "node --import tsx scripts/check-declarations.ts",
+    "check:smoke": "node --import tsx scripts/check-package-smoke.ts",
+    "prepublishOnly": "npm run build",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@temporalio/activity": "~1.20.0",
+    "@temporalio/client": "~1.20.0",
+    "@temporalio/common": "~1.20.0",
+    "@temporalio/worker": "~1.20.0",
+    "@temporalio/workflow": "~1.20.0"
+  },
+  "//peer": "The Worker plugin contract is the host SDK's, and a plugin that bundles its own copy would run against a second, different Temporal runtime \u2014 the host's Worker would not even recognise it. Declared as peers so one SDK is installed, and kept in devDependencies for building and testing here."
+}
