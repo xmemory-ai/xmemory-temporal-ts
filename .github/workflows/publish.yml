@@ -1,0 +1,216 @@
+name: publish
+
+# Publishes @xmemory/temporal to npm when a GitHub Release is published.
+# No token is required today — add one before the first release (see below).
+#
+# Three jobs, each holding as little as it needs:
+#
+# * `pack` builds the artifact that will be published, from a `--ignore-scripts`
+#   install, and runs no third-party executable. The integration tests download and
+#   execute a Temporal test-server binary with no digest to check it against; doing
+#   that in the same job as the build would let it rewrite the workspace between the
+#   build and the pack.
+# * `verify` runs the tests and gates. It executes that binary, holds no credential,
+#   and produces nothing that ships.
+# * `npm` publishes the exact tarball `pack` produced, only if `verify` passed. It
+#   installs nothing, so no dependency code runs in the job holding the credential.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing here pushes, and the token would otherwise stay in the git
+          # config while project scripts run.
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Install (locked, no install hooks)
+        # `prepare` is skipped along with everything else, so the build is explicit.
+        run: npm ci --ignore-scripts
+      - name: Check the release commit is on main
+        # A Release can be cut from any commit, and anyone with write access can
+        # publish one — so without this, a tag on a side branch reaches the npm
+        # credential. `compare` reports `behind` or `identical` when the commit is an
+        # ancestor of main. Protect the `v*` tags and require a deployment reviewer
+        # on the `npm` environment as well; neither is expressible in this file.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
+          case "$status" in
+            behind|identical) echo "release commit is on main ($status)" ;;
+            *) echo "refusing to publish ${GITHUB_SHA}: not an ancestor of main ($status)"; exit 1 ;;
+          esac
+      - name: Check the release tag matches package.json
+        # A mismatch here publishes a version nobody tagged, or fails after the
+        # release is already announced.
+        run: |
+          pkg="$(node -p 'require("./package.json").version')"
+          # `v$pkg` exactly, not a stripped prefix: `0.1.0` would otherwise pass here
+          # while falling outside the `v*` tag protection rule.
+          test "$GITHUB_REF_NAME" = "v$pkg" || {
+            echo "tag $GITHUB_REF_NAME is not v$pkg (the packaged version)"; exit 1; }
+      - name: Build
+        run: npm run build
+      - name: Pack
+        run: |
+          mkdir -p pack
+          npm pack --silent --pack-destination pack >/dev/null
+      - name: Check the packed artifact contents
+        # Inspected in Node rather than `tar | grep -q`, which SIGPIPEs the tar
+        # under `pipefail` and reports a present file as missing.
+        run: |
+          node -e '
+            const { execFileSync } = require("node:child_process");
+            const fs = require("node:fs");
+            const tgz = fs.readdirSync("pack").find((f) => f.endsWith(".tgz"));
+            const names = execFileSync("tar", ["-tzf", `pack/${tgz}`], { encoding: "utf8" }).split("\n");
+            const required = ["package/LICENSE", "package/NOTICE", "package/dist/index.js", "package/dist/workflow.js"];
+            const missing = required.filter((f) => !names.includes(f));
+            if (missing.length) {
+              console.error(`missing from the tarball: ${missing.join(", ")}`);
+              process.exit(1);
+            }
+            const forbidden = names.filter((f) => f === "package/TESTING.md");
+            if (forbidden.length) {
+              console.error(`must not ship: ${forbidden.join(", ")}`);
+              process.exit(1);
+            }
+            console.log("tarball contains the license files and both entry points");
+          '
+      - name: Record what is being published
+        # Uploaded with the tarball and checked at every later hop, so the bytes the
+        # gates inspect and the bytes that reach npm are provably the ones built
+        # here. Bare filenames, so `sha256sum --check` works from any directory the
+        # artifact is unpacked into.
+        working-directory: pack
+        run: sha256sum ./*.tgz | tee SHA256SUMS
+      - name: Hand the artifact to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-tarball
+          # The digest file travels with the tarball; a checksum left behind proves
+          # nothing downstream.
+          path: |
+            pack/*.tgz
+            pack/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+
+  verify:
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Install (locked)
+        run: npm ci
+      - name: Lint / type-check
+        run: npm run lint
+      - name: Warm the Temporal test-server binary
+        # Same reason as CI: `node --test` runs files in parallel, and a cold run has
+        # them race to download the same binary.
+        run: node --import tsx -e "import('@temporalio/testing').then(async (m) => { const e = await m.TestWorkflowEnvironment.createTimeSkipping(); await e.teardown(); })"
+      - name: Test
+        run: npm test
+      - name: Take the artifact `pack` produced
+        # Downloaded *after* the tests, not before: those run a dependency install
+        # and a downloaded Temporal binary, either of which could rewrite a copy
+        # sitting in the workspace. The gates below must inspect the published bytes.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarball
+          path: artifact
+      - name: Check the artifact against the digest `pack` recorded
+        working-directory: artifact
+        run: sha256sum --check SHA256SUMS
+      - name: Resolve the artifact path
+        run: echo "XMEMORY_TARBALL=$(ls "$PWD"/artifact/*.tgz)" >> "$GITHUB_ENV"
+      - name: Workflow bundle check (the artifact being published)
+        run: npm run check:bundle
+      - name: Declaration check (node16 / nodenext / bundler consumers)
+        # Runs on the release path too: a vendor type reaching our .d.ts breaks
+        # those consumers while our own build stays green, and a published
+        # version cannot be taken back.
+        run: npm run check:declarations
+      - name: Package smoke check (the artifact actually loads)
+        # The two gates above never execute the root entry: one type-checks, the
+        # other bundles the workflow subpath. A tarball whose dist/index.js throws
+        # on import passed both.
+        run: npm run check:smoke
+      - name: Re-check the digest after the gates
+        # The gates install and execute the packaged code; this proves the file they
+        # ran is still the file `pack` built.
+        working-directory: artifact
+        run: sha256sum --check SHA256SUMS
+
+  npm:
+    needs: [pack, verify]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Take the artifact `pack` produced
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarball
+          path: pack
+      - name: Publish to npm
+        # The tarball itself, so what is published is what was built and checked.
+        # `--provenance` requires id-token: write and a PUBLIC source repo — flip
+        # this repo public before the first release (Phase C), or drop the flag.
+        # `--access public` is required for a scoped (@xmemory) package.
+        # --ignore-scripts: nothing in this job should execute package code.
+        # The dist-tag is explicit: this workflow fires for prereleases too, and
+        # npm's default would make `1.0.0-rc.1` the version `npm install` resolves.
+        #
+        # Taken from the version itself, not from the Release checkbox: SemVer is
+        # what defines a prerelease, and the checkbox is a separate field a release
+        # author can forget. A disagreement between them is a mistake either way, so
+        # it stops the publish rather than picking a winner.
+        env:
+          PRERELEASE_FLAG: ${{ github.event.release.prerelease }}
+          # TOKEN: set the NPM_TOKEN secret (a granular access token) before the
+          # first release.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: pack
+        run: |
+          # The same digest `pack` recorded, checked once more in the job that holds
+          # the credential — nothing here has run any packaged or dependency code.
+          sha256sum --check SHA256SUMS
+          version="${GITHUB_REF_NAME#v}"
+          # Build metadata first: `1.0.0+build-1` is a stable release whose `+`
+          # component may itself contain a hyphen. Only what precedes it decides.
+          case "${version%%+*}" in
+            *-*) dist_tag=next; is_prerelease=true ;;
+            *)   dist_tag=latest; is_prerelease=false ;;
+          esac
+          if [ "$PRERELEASE_FLAG" != "$is_prerelease" ]; then
+            echo "version $version says prerelease=$is_prerelease, the Release says $PRERELEASE_FLAG"
+            echo "fix whichever is wrong and re-run; refusing to guess which tag to publish under"
+            exit 1
+          fi
+          echo "publishing $version under dist-tag $dist_tag"
+          npm publish "$(ls ./*.tgz)" --tag "$dist_tag" --provenance --access public --ignore-scripts
