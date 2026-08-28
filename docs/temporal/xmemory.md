@@ -76,11 +76,14 @@ const context = await inst.read(`What should support know about ${customerId}?`)
 await inst.write('... interaction summary ...');
 ```
 
-To add Durable Execution, implement the same logic as a Temporal Workflow. Call `xmemoryForWorkflow()` to get a handle with the same methods. The call sites are identical, so migration is near-zero-diff.
+To add Durable Execution, implement the same logic as a Temporal Workflow. Call `xmemoryForWorkflow()` to get a handle with the same method names. The call sites are close to identical, so migration is near-zero-diff — the differences are that results are this plugin's own flattened DTOs rather than the client's raw shapes, and that the durable helpers (`writeDurable`, `writeAsyncStart`) exist only here.
 
 ```ts {5,7,11}
 // workflows.ts
-import { xmemoryForWorkflow } from '@xmemory/temporal';
+// The workflow-safe subpath: it reaches no Activity code and no xmemory client,
+// so Temporal's workflow bundler accepts it. The package root loads the plugin
+// and the client, and belongs in worker setup only.
+import { xmemoryForWorkflow } from '@xmemory/temporal/workflow';
 
 export async function customerSupportWorkflow(customerId: string, interactionId: string, message: string): Promise<unknown> {
   const mem = xmemoryForWorkflow();
@@ -97,7 +100,11 @@ export async function customerSupportWorkflow(customerId: string, interactionId:
 }
 ```
 
-All memory I/O runs in Activities, so the Workflow stays deterministic and replay-safe: Temporal replays your Workflow code but never re-runs a completed Activity, so a replay never repeats a memory read or write. Importing `xmemoryForWorkflow` from the package root is safe — the package is side-effect-free, so the Workflow bundler tree-shakes the plugin and client out of the sandbox.
+All memory I/O runs in Activities, so the Workflow stays deterministic and replay-safe: Temporal replays your Workflow code but never re-runs a completed Activity, so a replay never repeats a memory read or write. Workflow code imports `xmemoryForWorkflow` from `@xmemory/temporal/workflow`, a leaf entry point that reaches no Activity code and no client; the package root loads both and belongs in Worker setup only.
+
+> **Memory is untrusted data in both directions.** What goes in is user-controlled; what comes back is that text plus whatever the extraction engine made of it. Reading it into a prompt is the indirect prompt-injection path, so treat a read result as data to quote and bound, never as instructions.
+>
+> **One Worker, one instance.** The Activities are generic and bind to whichever instance the plugin configured, so every Worker polling a Task Queue must share that configuration. Per-tenant isolation means a Task Queue (and Worker) per tenant — not a per-Workflow option, and the tenant must come from an authenticated identity your service establishes rather than from a caller- or model-supplied value. The example below writes and reads a single shared instance, naming the customer in the text rather than isolating them; do not use it as-is for multi-user data that must be kept apart.
 
 ## Write durably
 
@@ -132,7 +139,7 @@ xmemory errors become `ApplicationFailure`s with stable `type` strings you can m
 | `UNAUTHORIZED` / `FORBIDDEN` | `XmemoryAuthFailed` | no |
 | `NOT_FOUND` | `XmemoryNotFound` | no |
 | validation / schema-evolution rejections | `XmemoryBadRequest` / `XmemorySchemaRejected` | no |
-| an unrecognized code | `XmemoryUnknown` | yes (never fatal) |
+| an unrecognized code | `XmemoryUnknown` | follows the HTTP status |
 
 The durable-write loop adds `XmemoryWriteFailed`, `XmemoryWriteNotFound`, and `XmemoryWriteTimeout`, all non-retryable.
 
