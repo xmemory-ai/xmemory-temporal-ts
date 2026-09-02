@@ -55,9 +55,18 @@ function isKnownUpstream(line: string): boolean {
 
 const CONSUMER = `
 import { XmemoryPlugin, XmemoryConfig, TYPE_BAD_OPTIONS } from '@xmemory/temporal';
-import { xmemoryForWorkflow, TYPE_WRITE_TIMEOUT, type WriteMutation } from '@xmemory/temporal/workflow';
+import {
+  xmemoryForWorkflow,
+  TYPE_WRITE_TIMEOUT,
+  type WriteMutation,
+  type WriteStatusRetry,
+} from '@xmemory/temporal/workflow';
 
 export const config: XmemoryConfig = { instanceId: 'inst-1' };
+// The poll options a caller tunes, named as a type: this is the newest piece of the
+// public surface, so a consumer has to be able to reach and satisfy it.
+export const pollRetry: WriteStatusRetry = { attempts: 4, intervalMs: 2_000, maxIntervalMs: 8_000 };
+export const tuned = xmemoryForWorkflow({ writeStatusRetry: pollRetry });
 export const plugin = new XmemoryPlugin(config);
 export const failureTypes: string[] = [TYPE_BAD_OPTIONS, TYPE_WRITE_TIMEOUT];
 export async function readIt(): Promise<unknown> {

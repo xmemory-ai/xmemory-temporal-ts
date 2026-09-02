@@ -10,7 +10,6 @@
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import path from 'node:path';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker } from '@temporalio/worker';
 import type { WorkflowHandle } from '@temporalio/client';
@@ -21,17 +20,13 @@ import {
   durableWriteWorkflow,
   badOptionsDurableWriteWorkflow,
   badOptionsContainerWorkflow,
-  badPollPolicyDurableWriteWorkflow,
-  badReadPolicyWorkflow,
   boundedReadWorkflow,
-  derivedMaxIntervalPollPolicyWorkflow,
-  longIntervalPollPolicyWorkflow,
-  malformedPolicyContainerWorkflow,
   nonStringQueryWorkflow,
   nonStringTextWorkflow,
-  mutatedPollPolicyWorkflow,
+  badWriteStatusRetryWorkflow,
   noTextDurableWriteWorkflow,
   pollutedPolicyDurableWriteWorkflow,
+  pollutedWritePolicyWorkflow,
   nonStringWriteIdWorkflow,
   stringSummaryFlagWorkflow,
   optionsOverrideTextWorkflow,
@@ -39,14 +34,8 @@ import {
   unboundedWritePolicyWorkflow,
   nullOptionsWorkflow,
   totalBoundedDurableWriteWorkflow,
-  nonArrayErrorTypesWorkflow,
+  tunedPollDurableWriteWorkflow,
   nonRetryableStatusDurableWriteWorkflow,
-  negativeIntervalPollPolicyWorkflow,
-  nonStringErrorTypePollPolicyWorkflow,
-  subNanosecondIntervalPollPolicyWorkflow,
-  overflowPollPolicyWorkflow,
-  serviceRejectedPollPolicyWorkflow,
-  unlimitedPollPolicyWorkflow,
   badDurationDurableWriteWorkflow,
   badReadTimeoutWorkflow,
   infiniteReadTimeoutWorkflow,
@@ -450,79 +439,6 @@ test('an equal retry hint still prevents an early poll', async () => {
   assert.equal(fake.count('writeStatus'), 1, 'polled again inside the hinted window');
 });
 
-test('an unusable poll policy is refused before the write is enqueued', async () => {
-  // Temporal compiles the poll policy when it schedules the first poll — after the
-  // enqueue — so an unusable one leaves a queued write nobody observes. The last
-  // three are what `compileRetryPolicy` alone misses; only the service refuses them.
-  const cases: { workflow: unknown; arg: number; what: string }[] = [
-    { workflow: badPollPolicyDurableWriteWorkflow, arg: 0, what: 'maximumAttempts 0' },
-    { workflow: serviceRejectedPollPolicyWorkflow, arg: 0.5, what: 'backoffCoefficient 0.5' },
-    { workflow: overflowPollPolicyWorkflow, arg: 2_147_483_648, what: 'maximumAttempts past int32' },
-    { workflow: negativeIntervalPollPolicyWorkflow, arg: -1, what: 'a negative initialInterval' },
-  ];
-  // These need no argument: the unusable value is baked into the fixture.
-  const noArgCases: { workflow: unknown; what: string }[] = [
-    { workflow: nonStringErrorTypePollPolicyWorkflow, what: 'a non-string nonRetryableErrorTypes entry' },
-    { workflow: subNanosecondIntervalPollPolicyWorkflow, what: 'an interval below one nanosecond' },
-    { workflow: derivedMaxIntervalPollPolicyWorkflow, what: 'an initialInterval whose derived maximum overflows' },
-  ];
-  for (const { workflow, arg, what } of cases) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(workflow as never, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [arg] as never,
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${what} was not rejected`,
-    );
-    assert.equal(fake.count('writeAsync'), 0, `enqueued despite ${what}`);
-  }
-  for (const { workflow, what } of noArgCases) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(workflow as never, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [] as never,
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${what} was not rejected`,
-    );
-    assert.equal(fake.count('writeAsync'), 0, `enqueued despite ${what}`);
-  }
-});
-
-test('an unusable policy on a plain call fails the workflow, not every Workflow Task', async () => {
-  // `read` has no enqueue to orphan, but an unusable policy still raises a raw
-  // ValueError while the Activity command is built. Temporal reads that as a
-  // Workflow *Task* failure: the workflow neither fails nor progresses, it retries
-  // the same task forever. A typed non-retryable failure ends it instead.
-  const fake = new FakeXmemoryInstance();
-  const w = await worker(fake);
-  await assert.rejects(
-    () =>
-      w.runUntil(
-        env.client.workflow.execute(badReadPolicyWorkflow, {
-          taskQueue: TASK_QUEUE,
-          workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          args: [0],
-        }),
-      ),
-    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-  );
-  assert.equal(fake.count('read'), 0, 'reached the backend despite an unusable policy');
-});
-
 test('a poll stopped by nonRetryableErrorTypes is not polled again', async () => {
   // Temporal reports that verdict on the ActivityFailure's retryState; the
   // ApplicationFailure's own nonRetryable stays false. Reading only the latter, the
@@ -580,10 +496,29 @@ test('a non-string text or query is refused before anything is scheduled', async
   }
 });
 
-test('an inherited retry-type list is not promoted into a default policy', async () => {
-  // The snapshot read the caller's object before copying it, so an inherited
-  // `nonRetryableErrorTypes` was copied in and then looked like theirs. A poll that
-  // should have been retried became terminal, aborting a write already enqueued.
+test('an inherited retry-type list is not promoted into a caller policy', async () => {
+  // Read and write policies are still the caller's own objects, copied by
+  // `snapshotPolicy` — which copies first and reads the copy, so an inherited
+  // `nonRetryableErrorTypes` cannot be pulled in and then look like theirs. Here it
+  // would turn a retryable server error terminal and stop the opted-in retry.
+  const fake = new FakeXmemoryInstance();
+  fake.failWriteTimes(1, apiError({ status: 500, code: 'INTERNAL_ERROR' }));
+  const w = await worker(fake);
+  const writeId = await w.runUntil(
+    env.client.workflow.execute(pollutedWritePolicyWorkflow, {
+      taskQueue: TASK_QUEUE,
+      workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
+      args: ['remember'],
+    }),
+  );
+  assert.equal(writeId, 'w1');
+  assert.equal(fake.count('write'), 2, 'the retryable server error was treated as terminal');
+});
+
+test('an inherited retry-type list is not promoted into the built poll policy', async () => {
+  // The policy this package builds is a plain object, so it inherits from
+  // Object.prototype unless copied onto a null one. An inherited
+  // `nonRetryableErrorTypes` would make a retryable poll failure terminal.
   const fake = new FakeXmemoryInstance();
   fake.statusSequence(['completed']);
   fake.failStatusTimes(1, apiError({ status: 500, code: 'INTERNAL_ERROR' }));
@@ -598,23 +533,47 @@ test('an inherited retry-type list is not promoted into a default policy', async
   assert.equal(out, 'completed', 'the retryable server error was treated as terminal');
 });
 
-test('a poll policy mutated after the enqueue does not reach Temporal', async () => {
-  // The policy is validated before the enqueue, but the caller keeps its reference
-  // and its code runs between our awaits. Mutating it left a queued write with a
-  // policy Temporal refuses, so no poll was ever scheduled and every Workflow Task
-  // failed. A private copy at the boundary is what stops that.
+test('unusable poll options enqueue nothing', async () => {
+  // The scalars themselves are checked in the constructor — activities.test.ts
+  // covers the range of them without a Worker. What needs a workflow is this: the
+  // rejection lands before the enqueue, which is the ordering that made a bad poll
+  // policy dangerous in the first place.
   const fake = new FakeXmemoryInstance();
-  fake.statusSequence(['completed']);
   const w = await worker(fake);
-  const out = await w.runUntil(
-    env.client.workflow.execute(mutatedPollPolicyWorkflow, {
-      taskQueue: TASK_QUEUE,
-      workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-      args: [],
-    }),
+  await assert.rejects(
+    () =>
+      w.runUntil(
+        env.client.workflow.execute(badWriteStatusRetryWorkflow, {
+          taskQueue: TASK_QUEUE,
+          workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
+          args: [{ attempts: 0 }] as never,
+        }),
+      ),
+    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
   );
-  assert.equal(out, 'completed');
-  assert.ok(fake.count('writeStatus') >= 1, 'no status poll was scheduled');
+  assert.equal(fake.count('writeAsync'), 0, 'enqueued despite unusable poll options');
+});
+
+test('the poll policy Temporal schedules is the one built from the options', async () => {
+  // The point of building it: what reaches Temporal is derived from the scalars,
+  // not passed through from the caller. Asserted on the scheduled command.
+  const fake = new FakeXmemoryInstance();
+  fake.statusSequence(['processing', 'completed']);
+  const w = await worker(fake);
+  const workflowId = `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+  await w.runUntil(
+    env.client.workflow.execute(tunedPollDurableWriteWorkflow, { taskQueue: TASK_QUEUE, workflowId, args: [] }),
+  );
+  const history = await env.client.workflow.getHandle(workflowId).fetchHistory();
+  const scheduled = (history.events ?? [])
+    .map((event) => event.activityTaskScheduledEventAttributes)
+    .filter((a) => a?.activityType?.name === 'xmemory_write_status');
+  assert.ok(scheduled.length > 0, 'no status poll was scheduled');
+  const policy = scheduled[0]?.retryPolicy;
+  assert.equal(policy?.maximumAttempts, 4);
+  assert.equal(Number(policy?.initialInterval?.seconds ?? 0), 2);
+  assert.equal(Number(policy?.maximumInterval?.seconds ?? 0), 8);
+  assert.equal(Number(policy?.backoffCoefficient ?? 0), 2);
 });
 
 test('a non-boolean summary flag is refused, not read as truthy', async () => {
@@ -731,30 +690,6 @@ test('a write policy that does not say how many attempts is refused', async () =
   assert.equal(plain.count('write'), 0, 'wrote under an unbounded write policy');
 });
 
-test('a retry policy that is not an object is refused', async () => {
-  // An array, string, number or boolean has none of a policy's fields, so every
-  // check passes and Temporal compiles it with maximumAttempts unset — unlimited.
-  // On writeRetryPolicy that silently replaces this package's at-most-once default
-  // and lets a non-idempotent text write repeat.
-  for (const value of [[], 'foo', 42, true]) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(malformedPolicyContainerWorkflow, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [value],
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${JSON.stringify(value)} was not rejected`,
-    );
-    assert.equal(fake.count('write'), 0, `wrote despite ${JSON.stringify(value)}`);
-  }
-});
-
 test('options arriving as null are treated as omitted', async () => {
   // A default parameter only applies to `undefined`, and workflow arguments are
   // JSON, where an omitted object is usually `null`. Reading a field off it threw a
@@ -771,29 +706,6 @@ test('options arriving as null are treated as omitted', async () => {
   );
   assert.equal(writeId, 'w1');
   assert.equal(fake.count('write'), 1);
-});
-
-test('a retry-type list that is not a list is refused', async () => {
-  // A number or object is not iterable, so validating its members threw a raw
-  // TypeError inside workflow code — a Workflow Task failure, retried forever. A
-  // string is iterable and passed silently as one bogus type per character.
-  for (const value of [1, { a: 1 }, 'XmemoryAuthFailed']) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(nonArrayErrorTypesWorkflow, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [value],
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${JSON.stringify(value)} was not rejected`,
-    );
-    assert.equal(fake.count('read'), 0, `reached the backend with ${JSON.stringify(value)}`);
-  }
 });
 
 test('a durable poll never outlives a tighter total timeout', async () => {
@@ -843,24 +755,6 @@ test('a total timeout is scheduled as the activity\'s schedule-to-close', async 
     .filter((scheduled) => scheduled?.activityType?.name === 'xmemory_read')
     .map((scheduled) => Number(scheduled?.scheduleToCloseTimeout?.seconds ?? 0));
   assert.deepEqual(bounds, [5], 'the read was not scheduled under the 5s total');
-});
-
-test('valid policies the SDK compiles are not refused', async () => {
-  // The pre-enqueue check must reject only what the service would: `Infinity`
-  // attempts is Temporal's own spelling of unlimited, and a month-long interval is
-  // a protobuf Duration the service holds, not a `setTimeout` this package sets.
-  for (const workflow of [longIntervalPollPolicyWorkflow, unlimitedPollPolicyWorkflow]) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    const out = await w.runUntil(
-      env.client.workflow.execute(workflow, {
-        taskQueue: TASK_QUEUE,
-        workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-        args: [],
-      }),
-    );
-    assert.equal(out, 'completed');
-  }
 });
 
 test('the final look is a single attempt', async () => {

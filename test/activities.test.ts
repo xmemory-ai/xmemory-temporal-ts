@@ -13,6 +13,7 @@ import {
 import type { ReadOutput, WriteOutput, WriteStatusOutput } from '../src/dto';
 import * as errors from '../src/errors';
 import { activityBudgetMs } from '../src/deadline';
+import { xmemoryForWorkflow } from '../src/workflow';
 import { clientTimeoutMs } from '../src/defaults';
 import { FakeXmemoryInstance, apiError } from './fakes';
 import { InstanceHandle, XmemoryClient } from 'xmemory';
@@ -287,6 +288,33 @@ test('an activity past its deadline fails instead of sending a doomed request', 
     },
   );
   assert.equal(fake.count('read'), 0, 'no request may be sent past the deadline');
+});
+
+test('poll retry options that Temporal could not use are refused', () => {
+  // The policy is built from these in the constructor, which is plain arithmetic —
+  // no workflow needed to exercise it. The one thing that does need a workflow is
+  // that the rejection lands before the enqueue, which workflow.test.ts covers.
+  for (const [retry, what] of [
+    [{ attempts: 0 }, 'zero attempts'],
+    [{ attempts: 2.5 }, 'a fractional attempt count'],
+    [{ intervalMs: 0 }, 'a zero interval'],
+    [{ intervalMs: 1_000, maxIntervalMs: 500 }, 'a ceiling below the interval'],
+    [{ nonRetryableErrorTypes: 'XmemoryServerError' }, 'a string where a list belongs'],
+    ['nope', 'options that are not an object'],
+  ] as const) {
+    assert.throws(
+      () => xmemoryForWorkflow({ writeStatusRetry: retry as never }),
+      (err: unknown) => {
+        assert.equal((err as ApplicationFailure).type, 'XmemoryBadOptions', what);
+        assert.equal((err as ApplicationFailure).nonRetryable, true);
+        return true;
+      },
+      `${what} was accepted`,
+    );
+  }
+  // Unlimited is Temporal's own spelling, and the defaults stand on their own.
+  assert.doesNotThrow(() => xmemoryForWorkflow({ writeStatusRetry: { attempts: Number.POSITIVE_INFINITY } }));
+  assert.doesNotThrow(() => xmemoryForWorkflow({}));
 });
 
 test('the client deadline stays strictly under Temporal for every input', () => {

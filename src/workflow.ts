@@ -12,7 +12,6 @@ import { ApplicationFailure, isCancellation, log, proxyActivities, sleep, workfl
 import {
   ActivityFailure,
   ApplicationFailure as CommonApplicationFailure,
-  compileRetryPolicy,
   msToNumber,
   RetryState,
 } from '@temporalio/common';
@@ -49,8 +48,9 @@ const STATUS_COMPLETED = 'completed';
 const STATUS_FAILED = 'failed';
 const STATUS_NOT_FOUND = 'not_found';
 // Non-terminal states we keep polling through. Listed explicitly so a new,
-// unseen server-side state is treated as unknown and the loop fails loudly
-// rather than silently deciding it is terminal.
+// unseen server-side state is recognised as unknown and logged, rather than
+// passing silently — the loop polls on either way, since a state the enum has
+// grown must not fail a write that is still in flight.
 const STATUS_IN_PROGRESS = new Set(['queued', 'processing', 'extracting', 'extracted', 'applying']);
 
 const DEFAULT_READ_RETRY: RetryPolicy = {
@@ -64,12 +64,6 @@ const DEFAULT_READ_RETRY: RetryPolicy = {
 // surfaced to the workflow rather than retried. See the README's idempotency
 // section for when opting in is safe.
 const DEFAULT_WRITE_RETRY: RetryPolicy = { maximumAttempts: 1 };
-const DEFAULT_POLL_RETRY: RetryPolicy = {
-  initialInterval: '1s',
-  backoffCoefficient: 2,
-  maximumInterval: '20s',
-  maximumAttempts: 10,
-};
 // Shape the activity proxy is typed against (names -> IO types).
 interface ActivitySignatures {
   [ACTIVITY_READ]: (input: ReadInput) => Promise<ReadOutput>;
@@ -106,139 +100,6 @@ function durationMs(value: Duration, label: string): number {
     });
   }
   return ms;
-}
-
-// Temporal carries an attempt count as a signed int32; 2**31 arrives negative.
-const MAX_ATTEMPTS = 2_147_483_647;
-// Retry intervals are held by the service, not by `setTimeout`, so
-// `MAX_DURATION_MS` does not apply. The range that does: one nanosecond, below
-// which a positive interval encodes as no delay, up to the int64 nanosecond count
-// Temporal keeps them in (~292 years), past which it wraps negative.
-const MIN_INTERVAL_MS = 1e-6;
-const MAX_INTERVAL_MS = 9_223_372_036_854;
-// With `maximumInterval` unset Temporal derives one at 100x the initial. An
-// interval that fits alone can overflow through that: three years derives past int64.
-const DEFAULT_MAX_INTERVAL_FACTOR = 100;
-
-/**
- * Refuse a retry policy Temporal will not schedule, before the Activity starts.
- *
- * About failure *mode*, not about repeating the SDK's rules: an unusable policy
- * raises a raw `ValueError` while the Activity command is built, which Temporal
- * treats as a Workflow *Task* failure — the workflow neither fails nor progresses.
- * On `writeDurable` the enqueue happens first, leaving a queued write nobody polls.
- *
- * `compileRetryPolicy` is the SDK's contract, not the service's: it accepts a
- * sub-1 coefficient, an attempt count past int32, and a negative interval, all of
- * which the service refuses — after the enqueue.
- */
-// Everything `RetryPolicy` carries. Checked because Temporal ignores what it does
-// not recognise: `maximumAttempt` (singular) compiles to an unset `maximumAttempts`,
-// which means *unlimited* — a typo that silently opts a caller into retrying.
-const POLICY_FIELDS = new Set([
-  'initialInterval',
-  'backoffCoefficient',
-  'maximumInterval',
-  'maximumAttempts',
-  'nonRetryableErrorTypes',
-]);
-
-function assertSchedulablePolicy(policy: RetryPolicy, label: string): void {
-  const problems: string[] = [];
-  // The container before its fields: an array or string has none of them, so every
-  // check passes and the compiled policy has `maximumAttempts` unset — unlimited,
-  // which on a write replaces the at-most-once default.
-  if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) {
-    throw applicationFailure({
-      message: `${label} must be a RetryPolicy object, got ${policy === null ? 'null' : typeof policy}`,
-      type: TYPE_BAD_OPTIONS,
-      nonRetryable: true,
-    });
-  }
-  const unknown = Object.keys(policy).filter((key) => !POLICY_FIELDS.has(key));
-  if (unknown.length > 0) {
-    problems.push(`unknown field(s) ${unknown.join(', ')}; Temporal ignores those, so a typo changes how it retries`);
-  }
-  const { backoffCoefficient: coefficient, maximumAttempts: attempts } = policy;
-  if (coefficient !== undefined && (!Number.isFinite(coefficient) || coefficient < 1)) {
-    problems.push(`backoffCoefficient must be a finite number >= 1, got ${coefficient}`);
-  }
-  // `Infinity` is Temporal's own spelling of unlimited and compiles away to unset.
-  if (attempts !== undefined && attempts !== Number.POSITIVE_INFINITY) {
-    if (!Number.isInteger(attempts) || attempts < 0 || attempts > MAX_ATTEMPTS) {
-      problems.push(`maximumAttempts must be an integer between 0 and ${MAX_ATTEMPTS}, or Infinity, got ${attempts}`);
-    }
-  }
-  for (const [field, value] of [
-    ['initialInterval', policy.initialInterval],
-    ['maximumInterval', policy.maximumInterval],
-  ] as const) {
-    if (value === undefined) continue;
-    let ms: number;
-    try {
-      ms = msToNumber(value);
-    } catch {
-      problems.push(`${field} is not a valid duration: ${String(value)}`);
-      continue;
-    }
-    // A negative interval compiles and the service refuses it; zero and the
-    // interval ordering the SDK catches below. A positive value under a nanosecond
-    // encodes to no delay at all, so the polls it paces run flat out.
-    if (!Number.isFinite(ms) || ms < 0 || ms > MAX_INTERVAL_MS || (ms > 0 && ms < MIN_INTERVAL_MS)) {
-      problems.push(`${field} must be 0, or between ${MIN_INTERVAL_MS} and ${MAX_INTERVAL_MS}ms, got ${ms}`);
-    }
-  }
-  // Checked on the value Temporal will actually use: with `maximumInterval` unset
-  // the derived one is what overflows, and it is never seen in the policy object.
-  if (policy.maximumInterval === undefined && policy.initialInterval !== undefined) {
-    let initialMs: number | undefined;
-    try {
-      initialMs = msToNumber(policy.initialInterval);
-    } catch {
-      // Already reported above.
-    }
-    if (initialMs !== undefined && Number.isFinite(initialMs)) {
-      const derivedMs = initialMs * DEFAULT_MAX_INTERVAL_FACTOR;
-      if (derivedMs > MAX_INTERVAL_MS) {
-        problems.push(
-          `initialInterval ${initialMs}ms leaves Temporal to derive a maximumInterval of ${derivedMs}ms ` +
-            `(${DEFAULT_MAX_INTERVAL_FACTOR}x), past the ${MAX_INTERVAL_MS}ms it can hold. ` +
-            'Set maximumInterval explicitly, or lower initialInterval.',
-        );
-      }
-    }
-  }
-  // The container before its members: a number is not iterable, and a string is —
-  // silently passing as one bogus type per character.
-  const types = policy.nonRetryableErrorTypes;
-  if (types !== undefined && !Array.isArray(types)) {
-    problems.push(`nonRetryableErrorTypes must be an array of strings, got ${typeof types}`);
-  } else {
-    for (const value of types ?? []) {
-      // These are encoded as protobuf strings. A non-string compiles, then throws
-      // ERR_INVALID_ARG_TYPE when the Activity command is built — after the enqueue.
-      // Reachable from JavaScript callers and from anything typed `any`.
-      if (typeof value !== 'string') {
-        problems.push(`nonRetryableErrorTypes must all be strings, got ${typeof value}`);
-        break;
-      }
-    }
-  }
-  if (problems.length === 0) {
-    // Whatever the SDK itself refuses, on top of the checks above.
-    try {
-      compileRetryPolicy(policy);
-    } catch (err) {
-      problems.push(String(err));
-    }
-  }
-  if (problems.length > 0) {
-    throw applicationFailure({
-      message: `${label} is unusable: ${problems.join('; ')}`,
-      type: TYPE_BAD_OPTIONS,
-      nonRetryable: true,
-    });
-  }
 }
 
 /**
@@ -278,6 +139,77 @@ function requireText(value: unknown, label: string): string {
   return value;
 }
 
+/** How one status poll retries. Turned into a RetryPolicy by this package. */
+export interface WriteStatusRetry {
+  /** Attempts per poll, including the first. Default 10; `Infinity` for unlimited. */
+  attempts?: number;
+  /** Delay before the first retry, in ms. Default 1000. */
+  intervalMs?: number;
+  /** Ceiling on the backed-off delay, in ms. Default 20000. */
+  maxIntervalMs?: number;
+  /**
+   * Failure `type`s that end the polling instead of being retried.
+   *
+   * Only useful for types this package maps as retryable — an already
+   * non-retryable failure stops the polling on its own.
+   */
+  nonRetryableErrorTypes?: readonly string[];
+}
+
+const DEFAULT_WRITE_STATUS_RETRY = { attempts: 10, intervalMs: 1_000, maxIntervalMs: 20_000 };
+
+/**
+ * A poll retry policy built from scalars rather than taken from the caller.
+ *
+ * Temporal compiles a retry policy when it schedules the Activity, which for the
+ * first status poll is *after* `writeDurable` has enqueued the write — so an
+ * unusable one leaves a queued write nobody polls. Building it here means there is
+ * no policy to be unusable: three numbers are checked, and what Temporal gets is
+ * something it always accepts.
+ */
+function buildWriteStatusRetry(retry: WriteStatusRetry | undefined): RetryPolicy {
+  const opts = requireOptions(retry, 'writeStatusRetry');
+  const attempts = opts.attempts ?? DEFAULT_WRITE_STATUS_RETRY.attempts;
+  // `Infinity` is Temporal's own spelling of unlimited, and compiles away to unset.
+  if (attempts !== Number.POSITIVE_INFINITY && (!Number.isInteger(attempts) || attempts < 1)) {
+    throw applicationFailure({
+      message: `writeStatusRetry.attempts must be a positive integer or Infinity, got ${String(attempts)}`,
+      type: TYPE_BAD_OPTIONS,
+      nonRetryable: true,
+    });
+  }
+  const intervalMs = durationMs(opts.intervalMs ?? DEFAULT_WRITE_STATUS_RETRY.intervalMs, 'writeStatusRetry.intervalMs');
+  const maxIntervalMs = durationMs(
+    opts.maxIntervalMs ?? DEFAULT_WRITE_STATUS_RETRY.maxIntervalMs,
+    'writeStatusRetry.maxIntervalMs',
+  );
+  if (maxIntervalMs < intervalMs) {
+    throw applicationFailure({
+      message: `writeStatusRetry.maxIntervalMs (${maxIntervalMs}) must not be below intervalMs (${intervalMs})`,
+      type: TYPE_BAD_OPTIONS,
+      nonRetryable: true,
+    });
+  }
+  const types = opts.nonRetryableErrorTypes;
+  if (types !== undefined && (!Array.isArray(types) || types.some((t) => typeof t !== 'string'))) {
+    throw applicationFailure({
+      message: 'writeStatusRetry.nonRetryableErrorTypes must be an array of strings',
+      type: TYPE_BAD_OPTIONS,
+      nonRetryable: true,
+    });
+  }
+  // `ownOnly`, like every object handed to Temporal: the SDK reads the fields of
+  // this policy, and a plain literal would let a polluted prototype supply a
+  // `nonRetryableErrorTypes` the caller never set.
+  return ownOnly({
+    initialInterval: intervalMs,
+    backoffCoefficient: 2,
+    maximumInterval: maxIntervalMs,
+    maximumAttempts: attempts,
+    ...(types !== undefined ? { nonRetryableErrorTypes: [...types] } : {}),
+  });
+}
+
 /**
  * A private copy of a retry policy. The caller keeps its own reference and its code
  * runs between our awaits, so a policy validated before the enqueue could be
@@ -301,7 +233,15 @@ export interface WorkflowXmemoryOptions {
   writeStatusTimeout?: Duration;
   readRetryPolicy?: RetryPolicy;
   writeRetryPolicy?: RetryPolicy;
-  pollRetryPolicy?: RetryPolicy;
+  /**
+   * How each status poll retries.
+   *
+   * Scalars rather than a `RetryPolicy`: Temporal compiles a policy when it
+   * schedules the Activity, and for the first poll that is after `writeDurable` has
+   * enqueued the write. Built here, it cannot be a policy Temporal refuses. Distinct
+   * from `WriteDurableOptions.pollIntervalMs`, which paces the loop between polls.
+   */
+  writeStatusRetry?: WriteStatusRetry;
   /**
    * Total bound on a call including its retries, as `scheduleToCloseTimeout`.
    *
@@ -356,7 +296,7 @@ export class WorkflowXmemory {
       writeStatusTimeout: options.writeStatusTimeout ?? DEFAULT_TIMEOUTS.writeStatusMs,
       readRetry: snapshotPolicy(options.readRetryPolicy ?? DEFAULT_READ_RETRY),
       writeRetry: snapshotPolicy(options.writeRetryPolicy ?? DEFAULT_WRITE_RETRY),
-      pollRetry: snapshotPolicy(options.pollRetryPolicy ?? DEFAULT_POLL_RETRY),
+      pollRetry: buildWriteStatusRetry(options.writeStatusRetry),
       totalTimeout: options.totalTimeout,
       // `=== true`, not truthiness: options can be built from config, and the string
       // "false" would otherwise put memory text into the Activity summary, which is
@@ -369,7 +309,6 @@ export class WorkflowXmemory {
     query = requireText(query, 'read: query');
     options = requireOptions(options, 'read');
     durationMs(this.opts.readTimeout, 'read: timeout');
-    assertSchedulablePolicy(this.opts.readRetry, 'read: readRetryPolicy');
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.readTimeout,
       ...this.totalBound(),
@@ -443,7 +382,6 @@ export class WorkflowXmemory {
   async writeStatus(writeId: string): Promise<WriteStatusOutput> {
     writeId = requireText(writeId, 'writeStatus: writeId');
     durationMs(this.opts.writeStatusTimeout, 'writeStatus: timeout');
-    assertSchedulablePolicy(this.opts.pollRetry, 'writeStatus: pollRetryPolicy');
     return this.pollStatus(writeId, undefined);
   }
 
@@ -512,8 +450,6 @@ export class WorkflowXmemory {
         nonRetryable: true,
       });
     }
-
-    assertSchedulablePolicy(this.opts.pollRetry, 'writeDurable: pollRetryPolicy');
 
     const start = await this.writeAsyncStart(text, {
       extractionLogic: options.extractionLogic ?? 'deep',
@@ -603,15 +539,15 @@ export class WorkflowXmemory {
   }
 
   /**
-   * Validate the write policy, including that it says what it does about retrying.
+   * A write policy has to say how many attempts it wants.
    *
    * Writes are at-most-once by default: xmemory assigns primary keys with a model,
    * so a re-extraction can fork a record. Temporal reads an unset `maximumAttempts`
    * as unlimited, so a policy omitting it discards that default silently. Opting in
-   * is allowed, it just has to be said.
+   * is allowed, it just has to be said. Everything else about a read or write policy
+   * is Temporal's to judge, when it schedules the Activity.
    */
   private assertWritePolicy(call: string): void {
-    assertSchedulablePolicy(this.opts.writeRetry, `${call}: writeRetryPolicy`);
     if (this.opts.writeRetry.maximumAttempts === undefined) {
       throw applicationFailure({
         message:
