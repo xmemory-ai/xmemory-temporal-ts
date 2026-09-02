@@ -14,7 +14,7 @@ export type { XmemoryTimeouts } from './defaults';
 // Workflow-side values live at `@xmemory/temporal/workflow`, never here: this
 // entry reaches @temporalio/activity and the xmemory client, both of which the
 // workflow bundler rejects. Types are erased, so they are safe to re-export.
-export type { WorkflowXmemory, WorkflowXmemoryOptions, WriteDurableOptions } from './workflow';
+export type { WorkflowXmemory, WorkflowXmemoryOptions, WriteDurableOptions, WriteStatusRetry } from './workflow';
 export type { AutoCaptureConfig } from './interceptor';
 // The `type` strings themselves, so a consumer can match on them in a
 // RetryPolicy without hard-coding literals. The export map has no deep-import

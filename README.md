@@ -172,6 +172,23 @@ package can predict for you. Backoff slows the growth until the interval reaches
 with the rest of your workflow; the loop warns once Temporal itself suggests
 continuing as new.
 
+Two different kinds of pacing sit here, so the names are worth separating.
+`pollIntervalMs` and `maxPollIntervalMs` set how long the loop waits *between*
+polls. `writeStatusRetry` sets how one poll retries when it fails — attempts and
+backoff for the activity itself:
+
+```ts
+const mem = xmemoryForWorkflow({
+  writeStatusRetry: { attempts: 4, intervalMs: 2_000, maxIntervalMs: 8_000 },
+});
+```
+
+Those are plain numbers rather than a Temporal `RetryPolicy`, and this package
+builds the policy from them. Temporal compiles a policy when it schedules the
+activity, which for the first poll is *after* the write is enqueued — so a policy it
+refuses would leave a queued write nobody is watching. There is no policy to refuse
+if the package builds it.
+
 This helper cannot call `continueAsNew` for you — it runs inside *your* workflow,
 and restarting that would discard your state. For multi-hour waits, run
 `writeDurable` in a child workflow.

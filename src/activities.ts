@@ -7,7 +7,6 @@
  */
 
 import { Context } from '@temporalio/activity';
-import { ApplicationFailure } from '@temporalio/common';
 import type { InstanceHandle } from 'xmemory';
 import type { XmemoryConfig } from './config';
 import { activityBudgetMs, withDeadline } from './deadline';

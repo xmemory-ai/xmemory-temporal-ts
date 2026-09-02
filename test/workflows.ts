@@ -77,70 +77,10 @@ export async function doubleWriteWorkflow(text: string): Promise<number> {
   return 2;
 }
 
-/** A poll policy the SDK's own compiler refuses, on the enqueue-then-poll path. */
-export async function badPollPolicyDurableWriteWorkflow(maximumAttempts: number): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { maximumAttempts } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** A coefficient the SDK compiles but the service refuses. */
-export async function serviceRejectedPollPolicyWorkflow(backoffCoefficient: number): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { backoffCoefficient } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** An attempt count the SDK compiles but the int32 wire format cannot carry. */
-export async function overflowPollPolicyWorkflow(maximumAttempts: number): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { maximumAttempts } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** Unlimited poll retries, which Temporal spells `Infinity`. Must be left alone. */
-export async function unlimitedPollPolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { maximumAttempts: Number.POSITIVE_INFINITY } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** An interval the SDK compiles but the service refuses. */
-export async function negativeIntervalPollPolicyWorkflow(initialInterval: number): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { initialInterval } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** A non-string in the reserved-type list, reachable from JavaScript callers. */
-export async function nonStringErrorTypePollPolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { nonRetryableErrorTypes: [1 as never] } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** A positive interval below one nanosecond, which encodes as no delay at all. */
-export async function subNanosecondIntervalPollPolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { initialInterval: 1e-7 } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** A month-long retry interval: the service keeps it, so it must be accepted. */
-export async function longIntervalPollPolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { initialInterval: 30 * 24 * 60 * 60_000, maximumAttempts: 1 } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** An initial interval whose *derived* maximum (100x) overflows what Temporal holds. */
-export async function derivedMaxIntervalPollPolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { initialInterval: 3 * 365 * 24 * 60 * 60_000 } });
-  return (await mem.writeDurable('remember', { maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** An unusable read policy: no side effect, but the Workflow Task would loop. */
-export async function badReadPolicyWorkflow(maximumAttempts: number): Promise<unknown> {
-  const mem = xmemoryForWorkflow({ readRetryPolicy: { maximumAttempts } });
-  return (await mem.read('q')).readerResult;
-}
-
 /** A durable write whose polls treat a server error as terminal. */
 export async function nonRetryableStatusDurableWriteWorkflow(): Promise<string> {
   const mem = xmemoryForWorkflow({
-    pollRetryPolicy: { maximumAttempts: 3, nonRetryableErrorTypes: ['XmemoryServerError'] },
+    writeStatusRetry: { attempts: 3, nonRetryableErrorTypes: ['XmemoryServerError'] },
   });
   return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
 }
@@ -151,22 +91,10 @@ export async function boundedReadWorkflow(): Promise<unknown> {
   return (await mem.read('q')).readerResult;
 }
 
-/** A retry policy whose reserved-type list is not a list at all. */
-export async function nonArrayErrorTypesWorkflow(value: unknown): Promise<unknown> {
-  const mem = xmemoryForWorkflow({ readRetryPolicy: { nonRetryableErrorTypes: value as never } });
-  return (await mem.read('q')).readerResult;
-}
-
 /** A durable write under a total bound tighter than the loop's own poll budget. */
 export async function totalBoundedDurableWriteWorkflow(): Promise<string> {
   const mem = xmemoryForWorkflow({ totalTimeout: '5s', writeStatusTimeout: '30s' });
   return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 60_000 })).writeStatus;
-}
-
-/** A retry policy that is not a policy object at all. */
-export async function malformedPolicyContainerWorkflow(value: unknown): Promise<string> {
-  const mem = xmemoryForWorkflow({ writeRetryPolicy: value as never });
-  return (await mem.write('remember')).writeId;
 }
 
 /** Options arriving as JSON `null` rather than omitted. */
@@ -186,17 +114,16 @@ export async function nonStringQueryWorkflow(value: unknown): Promise<unknown> {
   return (await mem.read(value as never)).readerResult;
 }
 
-/**
- * A durable write whose poll policy is mutated after the enqueue.
- *
- * The caller keeps its own reference, and its code runs between our awaits.
- */
-export async function mutatedPollPolicyWorkflow(): Promise<string> {
-  const policy = { maximumAttempts: 1 };
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: policy, writeStatusTimeout: '5s' });
-  const pending = mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 10_000 });
-  policy.maximumAttempts = 0; // invalid: Temporal refuses to schedule with this
-  return (await pending).writeStatus;
+/** Poll options Temporal could never be given, refused before anything is scheduled. */
+export async function badWriteStatusRetryWorkflow(retry: unknown): Promise<string> {
+  const mem = xmemoryForWorkflow({ writeStatusRetry: retry as never });
+  return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
+}
+
+/** A durable write whose polls use custom, valid retry pacing. */
+export async function tunedPollDurableWriteWorkflow(): Promise<string> {
+  const mem = xmemoryForWorkflow({ writeStatusRetry: { attempts: 4, intervalMs: 2_000, maxIntervalMs: 8_000 } });
+  return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
 }
 
 /** Content in the activity summary, switched on with a truthy string. */
@@ -206,7 +133,8 @@ export async function stringSummaryFlagWorkflow(): Promise<string> {
 }
 
 /**
- * A durable write under a workflow that polluted its own sandbox prototype.
+ * A durable write under a workflow that polluted its own sandbox prototype. Covers
+ * the *built* poll policy, which is a plain object this package creates.
  *
  * Workflow code runs in its own context, so this is where such pollution has to
  * come from — the caller's own code, or a library in their bundle.
@@ -216,6 +144,20 @@ export async function pollutedPolicyDurableWriteWorkflow(): Promise<string> {
   try {
     const mem = xmemoryForWorkflow();
     return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
+  } finally {
+    delete (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes;
+  }
+}
+
+/**
+ * An opted-in write retry under the same pollution. Covers `snapshotPolicy`, which
+ * guards the policies still passed through from the caller.
+ */
+export async function pollutedWritePolicyWorkflow(text: string): Promise<string> {
+  (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes = ['XmemoryServerError'];
+  try {
+    const mem = xmemoryForWorkflow({ writeRetryPolicy: { initialInterval: '1s', maximumAttempts: 3 } });
+    return (await mem.write(text)).writeId;
   } finally {
     delete (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes;
   }
@@ -268,7 +210,7 @@ export async function badDurationDurableWriteWorkflow(timeout: string): Promise<
  * means loop iterations rather than Temporal's retries within one.
  */
 export async function singleAttemptDurableWriteWorkflow(text: string): Promise<string> {
-  const mem = xmemoryForWorkflow({ pollRetryPolicy: { maximumAttempts: 1 } });
+  const mem = xmemoryForWorkflow({ writeStatusRetry: { attempts: 1 } });
   const out = await mem.writeDurable(text, { pollIntervalMs: 1_000, maxWaitMs: 15 * 60_000 });
   return out.writeStatus;
 }
