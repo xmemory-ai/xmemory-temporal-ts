@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # The label, not the version: these names are the required status checks in the
+    # branch ruleset, so a rename starves the merge queue on a check that never
+    # arrives. Pin the version behind a stable name instead.
+    name: Node.js ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.12 is the declared `engines` floor, not whatever 22.x is newest.
+          - label: "22"
+            version: "22.12"
+          - label: "24"
+            version: "24"
+          - label: "26"
+            version: "26"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing here pushes, and the token would otherwise stay in the git
+          # config while dependency hooks and downloaded binaries run.
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.version }}
+          cache: npm
+      - name: Install (locked)
+        run: npm ci
+      - name: Lint / type-check (src + test + examples)
+        run: npm run lint
+      - name: Warm the Temporal test-server binary
+        # `node --test` runs test files in parallel; a cold run has them race to
+        # download the same time-skipping server binary, which flakes. Download
+        # it once, single-process, so the parallel test run finds it cached.
+        run: node --import tsx -e "import('@temporalio/testing').then(async (m) => { const e = await m.TestWorkflowEnvironment.createTimeSkipping(); await e.teardown(); })"
+      - name: Test (no live backend)
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Workflow bundle check (against the packed artifact)
+        # The tests import ../src, so only this catches a root-entry import
+        # sneaking Activity or client code into the workflow sandbox bundle, or a
+        # packaging change that leaves the subpath export unresolvable.
+        run: npm run check:bundle
+      - name: Declaration check (node16 / nodenext / bundler consumers)
+        # This package emits CommonJS and xmemory is ESM-only, so a vendor type
+        # reaching our .d.ts breaks those consumers with TS1541 while our own
+        # build stays green.
+        run: npm run check:declarations
+      - name: Package smoke check (the artifact actually loads)
+        run: npm run check:smoke
