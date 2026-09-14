@@ -89,9 +89,8 @@ export interface WriteStatusOutput {
 
 // --- Projections from the client's result shapes ---------------------------
 //
-// Every field is read as an *own* property and type-checked. A response is JSON, so
-// a missing field is answered by `Object.prototype`: against a malformed `{}` these
-// once reported a write as `completed`, with an id no server sent.
+// Required fields are checked rather than defaulted, so a malformed response fails
+// as a transport error instead of reading as an empty answer or an unknown status.
 
 function ownField(result: unknown, field: string): unknown {
   return typeof result === 'object' && result !== null && Object.hasOwn(result, field)
@@ -113,7 +112,7 @@ function optionalString(result: unknown, field: string): string | null {
   return typeof value === 'string' ? value : null;
 }
 
-/** Present as an own property, whatever its type. `reader_result` may legitimately be null. */
+/** Present, whatever its type. `reader_result` may legitimately be null. */
 function requiredField(result: unknown, field: string): unknown {
   if (typeof result !== 'object' || result === null || !Object.hasOwn(result, field)) {
     throw new Error(`xmemory response has no ${field}`);

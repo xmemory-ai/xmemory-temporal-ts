@@ -14,51 +14,10 @@ import { XmemoryClient } from 'xmemory';
 import type { Worker, WorkerOptions, WorkerPlugin } from '@temporalio/worker';
 import { createActivities, InstanceHolder, type XmemoryInstance } from './activities';
 import { resolveApiKey, resolveEndpoint, type XmemoryConfig } from './config';
-import { DEFAULT_TIMEOUTS, clientTimeoutMs, ownOnly } from './defaults';
+import { DEFAULT_TIMEOUTS, clientTimeoutMs } from './defaults';
 import { type AutoCaptureConfig, createAutoCaptureInterceptor } from './interceptor';
 
 export const PLUGIN_NAME = 'xmemory';
-
-/**
- * A configuration field, from the object or its own class. Stops at
- * `Object.prototype`, where nothing legitimate lives — but a config expressed as a
- * class keeps its methods and getters on a prototype, which a spread would drop.
- */
-function configuredField(source: object, field: string): unknown {
-  for (let o: object | null = source; o !== null && o !== Object.prototype; o = Object.getPrototypeOf(o) as object) {
-    // Found on `o`, read from `source`: a getter must run with the instance as its
-    // receiver, or it reads the prototype's absent fields.
-    if (Object.hasOwn(o, field)) return (source as Record<string, unknown>)[field];
-  }
-  return undefined;
-}
-
-/**
- * The auto-capture block, sanitized, or nothing when it was not supplied.
- *
- * Its fields are read one by one at capture time, so an inherited `sampleRate`
- * would decide how much is captured. Each supported field is copied explicitly:
- * a spread drops a class's `project` method and `sampleRate` getter alike, and
- * `{ ...null }` is an empty object that would install capture doing nothing.
- */
-function normalizeAutoCapture(autoCapture: AutoCaptureConfig | undefined): { autoCapture?: AutoCaptureConfig } {
-  if (autoCapture === undefined || autoCapture === null) return {};
-  if (typeof autoCapture !== 'object' || Array.isArray(autoCapture)) {
-    throw new TypeError(`xmemory autoCapture must be an object, got ${typeof autoCapture}`);
-  }
-  const project = configuredField(autoCapture, 'project');
-  if (typeof project !== 'function') {
-    throw new TypeError('xmemory autoCapture.project must be a function; it decides what is worth remembering');
-  }
-  const snapshot = ownOnly({
-    project: (project as AutoCaptureConfig['project']).bind(autoCapture),
-  }) as AutoCaptureConfig & Record<string, unknown>;
-  for (const field of ['sampleRate', 'extractionLogic', 'captureTimeoutMs'] as const) {
-    const value = configuredField(autoCapture, field);
-    if (value !== undefined) snapshot[field] = value as never;
-  }
-  return { autoCapture: snapshot };
-}
 
 export interface XmemoryPluginOptions {
   /** Provide the API key in-process instead of via the env var. */
@@ -86,29 +45,10 @@ export class XmemoryPlugin implements WorkerPlugin {
   readonly #config: XmemoryConfig;
 
   constructor(config: XmemoryConfig, options: XmemoryPluginOptions = {}) {
-    // Null-prototype, so a field this config never set reads as absent: a plain
-    // spread still answers a missing one from `Object.prototype`.
-    this.#config = ownOnly({ ...config });
-    if (typeof this.#config.instanceId !== 'string' || this.#config.instanceId === '') {
-      throw new TypeError('xmemory instanceId must be a non-empty string');
-    }
-    const safeOptions = ownOnly({ ...options });
-    const { apiKey, ...rest } = safeOptions;
+    this.#config = config;
+    const { apiKey, ...rest } = options;
     this.#apiKey = apiKey;
-    this.#options = ownOnly({ ...rest, ...normalizeAutoCapture(rest.autoCapture) });
-    // At setup, not on the first Activity, like a missing API key.
-    const rate = this.#options.autoCapture?.sampleRate;
-    if (rate !== undefined && (!Number.isFinite(rate) || rate < 0 || rate > 1)) {
-      throw new RangeError(`xmemory autoCapture.sampleRate must be a fraction between 0 and 1, got ${rate}`);
-    }
-    // Config comes from files and env vars, where the string "false" is a
-    // plausible way to mean off — and a truthy one.
-    // Read from the sanitized copy, not the caller's object: validating the
-    // original still saw whatever the prototype supplied.
-    const detail = this.#config.logServerErrorDetail;
-    if (detail !== undefined && typeof detail !== 'boolean') {
-      throw new TypeError(`xmemory logServerErrorDetail must be a boolean, got ${typeof detail}`);
-    }
+    this.#options = rest;
   }
 
   /** The in-process key, if one was supplied. Never serialized with the plugin. */

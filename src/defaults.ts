@@ -1,5 +1,3 @@
-import { ApplicationFailure } from '@temporalio/common';
-
 /**
  * Default activity budgets and the client-margin rule.
  *
@@ -7,57 +5,6 @@ import { ApplicationFailure } from '@temporalio/common';
  * this module must never reach for `process.env` or the xmemory client the way
  * `config.ts` does.
  */
-
-/**
- * A copy of `value` with no prototype, so an absent field reads as absent.
- *
- * A plain object answers a missing field from `Object.prototype`, which lets
- * prototype pollution supply options nobody passed. Shallow: use `ownDeep` for
- * nested data.
- */
-export function ownOnly<T extends object>(value: T): T {
-  return Object.assign(Object.create(null) as T, value);
-}
-
-/**
- * A deep own-only copy, for data forwarded to the client — scopes, mutations.
- * Nested objects keep their own prototypes, so `ownOnly` alone is not enough:
- * an inherited `relationsScope` or `allow_bulk_delete` widens what the call does.
- *
- * Depth-bounded so a deeply nested payload fails as a bad option rather than as a
- * stack overflow, which would reach Temporal untyped and retryable.
- */
-export const MAX_OWN_DEEP_DEPTH = 64;
-
-export class TooDeepError extends Error {
-  constructor() {
-    super(`value nests deeper than ${MAX_OWN_DEEP_DEPTH} levels`);
-    this.name = 'TooDeepError';
-  }
-}
-
-export function ownDeep<T>(value: T, depth = 0): T {
-  if (depth > MAX_OWN_DEEP_DEPTH) throw new TooDeepError();
-  if (Array.isArray(value)) return value.map((item) => ownDeep(item, depth + 1)) as T;
-  if (typeof value === 'object' && value !== null) {
-    const copy = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.keys(value)) {
-      copy[key] = ownDeep((value as Record<string, unknown>)[key], depth + 1);
-    }
-    return copy as T;
-  }
-  return value;
-}
-
-/**
- * `ApplicationFailure.create` with prototype-proof options.
- *
- * The SDK reads fields off the object it is given, `cause` among them, and an
- * inherited one would be serialized into workflow history.
- */
-export function applicationFailure(options: Parameters<typeof ApplicationFailure.create>[0]): ApplicationFailure {
-  return ApplicationFailure.create(ownOnly({ ...options }));
-}
 
 /** Default `startToClose` budgets, in milliseconds. */
 export interface XmemoryTimeouts {
@@ -87,10 +34,10 @@ export const DEFAULT_TIMEOUTS: XmemoryTimeouts = {
 export const DEFAULT_CLIENT_MARGIN_MS = 5_000;
 
 /**
- * Upper bound on any duration this plugin accepts (24.8 days).
+ * The longest a Node timer can hold (24.8 days).
  *
- * `setTimeout` silently turns anything larger into 1ms, and the service rejects
- * oversized durations only when it builds the command — after the enqueue.
+ * `setTimeout` silently turns anything larger into 1ms. Client budgets are capped
+ * at it, and `writeDurable` refuses loop options past it before its enqueue.
  */
 export const MAX_DURATION_MS = 2_147_483_647;
 
@@ -104,12 +51,16 @@ export const MAX_DURATION_MS = 2_147_483_647;
  *
  * Only meaningful above timer resolution: a 1ms deadline yields 0.8ms, which
  * `setTimeout` rounds back to 1ms — the same instant Temporal uses.
+ *
+ * Capped at `MAX_DURATION_MS`, because the client arms a `setTimeout` with this
+ * value and Node fires anything larger after 1ms. The cap only applies to a deadline
+ * longer than that, so the client still gives up first.
  */
 export function clientTimeoutMs(activityMs: number, marginMs: number = DEFAULT_CLIENT_MARGIN_MS): number {
   if (!Number.isFinite(activityMs) || activityMs <= 0) {
     throw new RangeError(`activityMs must be a positive, finite number, got ${activityMs}`);
   }
   const margin = Number.isFinite(marginMs) && marginMs > 0 ? marginMs : 0;
-  if (margin === 0 || activityMs <= margin) return activityMs * 0.8;
-  return activityMs - margin;
+  const budgetMs = margin === 0 || activityMs <= margin ? activityMs * 0.8 : activityMs - margin;
+  return Math.min(budgetMs, MAX_DURATION_MS);
 }

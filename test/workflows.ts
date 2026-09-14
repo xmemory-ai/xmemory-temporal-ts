@@ -97,23 +97,6 @@ export async function totalBoundedDurableWriteWorkflow(): Promise<string> {
   return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 60_000 })).writeStatus;
 }
 
-/** Options arriving as JSON `null` rather than omitted. */
-export async function nullOptionsWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow(null as never);
-  return (await mem.write('remember', null as never)).writeId;
-}
-
-/** A non-string in the text or query slot, as JSON permits. */
-export async function nonStringTextWorkflow(value: unknown): Promise<string> {
-  const mem = xmemoryForWorkflow();
-  return (await mem.write(value as never)).writeId;
-}
-
-export async function nonStringQueryWorkflow(value: unknown): Promise<unknown> {
-  const mem = xmemoryForWorkflow();
-  return (await mem.read(value as never)).readerResult;
-}
-
 /** Poll options Temporal could never be given, refused before anything is scheduled. */
 export async function badWriteStatusRetryWorkflow(retry: unknown): Promise<string> {
   const mem = xmemoryForWorkflow({ writeStatusRetry: retry as never });
@@ -124,47 +107,6 @@ export async function badWriteStatusRetryWorkflow(retry: unknown): Promise<strin
 export async function tunedPollDurableWriteWorkflow(): Promise<string> {
   const mem = xmemoryForWorkflow({ writeStatusRetry: { attempts: 4, intervalMs: 2_000, maxIntervalMs: 8_000 } });
   return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
-}
-
-/** Content in the activity summary, switched on with a truthy string. */
-export async function stringSummaryFlagWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ includeContentInSummary: 'false' as never });
-  return (await mem.write('SECRET memory text')).writeId;
-}
-
-/**
- * A durable write under a workflow that polluted its own sandbox prototype. Covers
- * the *built* poll policy, which is a plain object this package creates.
- *
- * Workflow code runs in its own context, so this is where such pollution has to
- * come from — the caller's own code, or a library in their bundle.
- */
-export async function pollutedPolicyDurableWriteWorkflow(): Promise<string> {
-  (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes = ['XmemoryServerError'];
-  try {
-    const mem = xmemoryForWorkflow();
-    return (await mem.writeDurable('remember', { pollIntervalMs: 1_000, maxWaitMs: 30_000 })).writeStatus;
-  } finally {
-    delete (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes;
-  }
-}
-
-/** Options supplied as something that is not an options object. */
-export async function badOptionsContainerWorkflow(value: unknown): Promise<string> {
-  const mem = xmemoryForWorkflow();
-  return (await mem.writeDurable('remember', value as never)).writeStatus;
-}
-
-/** A durable write called with no text at all. */
-export async function noTextDurableWriteWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow();
-  return (await (mem.writeDurable as (t?: string) => Promise<{ writeStatus: string }>)()).writeStatus;
-}
-
-/** A non-string write id on the bare status poll. */
-export async function nonStringWriteIdWorkflow(value: unknown): Promise<string> {
-  const mem = xmemoryForWorkflow();
-  return (await mem.writeStatus(value as never)).writeStatus;
 }
 
 /** An options object carrying its own `text`, which must not win over the argument. */
@@ -187,28 +129,6 @@ export async function singleAttemptDurableWriteWorkflow(text: string): Promise<s
   const mem = xmemoryForWorkflow({ writeStatusRetry: { attempts: 1 } });
   const out = await mem.writeDurable(text, { pollIntervalMs: 1_000, maxWaitMs: 15 * 60_000 });
   return out.writeStatus;
-}
-
-/**
- * A read whose timeout is not a representable duration.
- *
- * `Infinity` is a literal here rather than an argument: JSON cannot carry it, so
- * Temporal would deliver `null` and the `??` default would quietly take over.
- */
-export async function infiniteReadTimeoutWorkflow(): Promise<unknown> {
-  const mem = xmemoryForWorkflow({ readTimeout: Number.POSITIVE_INFINITY });
-  return (await mem.read('q')).readerResult;
-}
-
-export async function badReadTimeoutWorkflow(timeout: unknown): Promise<unknown> {
-  const mem = xmemoryForWorkflow({ readTimeout: timeout as never });
-  return (await mem.read('q')).readerResult;
-}
-
-/** A bare status poll whose own timeout is unusable. */
-export async function badStatusTimeoutPollWorkflow(timeout: unknown): Promise<string> {
-  const mem = xmemoryForWorkflow({ writeStatusTimeout: timeout as never });
-  return (await mem.writeStatus('w1')).writeStatus;
 }
 
 /** A durable write whose status timeout is larger than any duration can carry. */

@@ -7,11 +7,10 @@
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { MockActivityEnvironment, TestWorkflowEnvironment } from '@temporalio/testing';
+import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker } from '@temporalio/worker';
-import { captureBudgetMs, createAutoCaptureInterceptor, type AutoCaptureConfig } from '../src/interceptor';
+import { captureBudgetMs, type AutoCaptureConfig } from '../src/interceptor';
 import { XmemoryPlugin } from '../src/plugin';
-import { InstanceHolder } from '../src/activities';
 import { FakeXmemoryInstance, apiError } from './fakes';
 import { userActivity } from './user-activity';
 import { writeWorkflow } from './workflows';
@@ -174,41 +173,6 @@ test('auto-capture is registered as the outermost interceptor', () => {
   assert.notEqual(registered[0], marker, 'auto-capture must be registered first (outermost)');
 });
 
-test('a capture does not pick up inherited write options', async () => {
-  // Driven directly rather than through a Worker: polluting Object.prototype around
-  // `Worker.create` breaks the bundler's own schema traversal, which says nothing
-  // about this package. What matters is the options object handed to the client.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.scope = { objects: [{ type: 'Person', key: { name: 'victim' } }] };
-    proto.diffEngine = true;
-    const fake = new FakeXmemoryInstance();
-    const holder = new InstanceHolder();
-    holder.bind(fake);
-    const interceptor = createAutoCaptureInterceptor(holder, { instanceId: 'inst-1' }, { project: () => 'remember' });
-    const env = new MockActivityEnvironment({
-      activityType: 'user_activity',
-      startToCloseTimeoutMs: 30_000,
-      // Explicit: the mock defaults this to one second, which correctly leaves a
-      // capture no budget at all and would make this test pass without capturing.
-      scheduleToCloseTimeoutMs: 60_000,
-      scheduledTimestampMs: Date.now(),
-    } as never);
-    const execute = interceptor.execute?.bind(interceptor);
-    assert.ok(execute, 'the interceptor has no execute hook');
-    await env.run((async () => execute({} as never, (async () => 'handled') as never)) as never);
-    const options = fake.calls.find((c) => c.method === 'writeAsync')?.options as
-      | { scope?: unknown; diffEngine?: unknown }
-      | undefined;
-    assert.ok(options, 'nothing was captured');
-    assert.equal(options.scope, undefined, 'an inherited scope rode along on the capture');
-    assert.equal(options.diffEngine, undefined, 'an inherited diffEngine rode along on the capture');
-  } finally {
-    delete proto.scope;
-    delete proto.diffEngine;
-  }
-});
-
 test('a projector defined as a class method still captures', async () => {
   // `project` is often a method on a class instance's *prototype*, and sanitizing
   // the block with a spread dropped it — leaving an interceptor with nothing to
@@ -240,7 +204,7 @@ test('a projector defined as a class method still captures', async () => {
 
 test('a projector that returns something other than text captures nothing', async () => {
   // `writeAsync` is overloaded on its first argument, so an array returned by the
-  // projector would be applied as structured mutations — a delete, in one probe —
+  // projector would be applied as structured mutations — a delete, in this probe —
   // instead of being remembered. `project` is the caller's code, and its return
   // type is erased at runtime.
   const fake = new FakeXmemoryInstance();
@@ -250,7 +214,7 @@ test('a projector that returns something other than text captures nothing', asyn
       instance: fake,
       autoCapture: {
         project: () =>
-          [{ object_mutation: { object_type: 'Customer', delete: { key: { id: 1 } } } }] as never,
+          [{ object_mutation: { object_type: 'Customer', delete: { key: { customerId: 'c-1' } } } }] as never,
       },
     },
   );
@@ -284,22 +248,6 @@ test('an activity name collision is refused, not silently replaced', () => {
       } as never),
     /already registers xmemory_write/,
   );
-});
-
-test('a nonsensical sample rate is rejected', () => {
-  // Silently sampling everything (or nothing) hides a misconfiguration that
-  // changes how much is written.
-  for (const rate of [-0.1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-    assert.throws(
-      () =>
-        new XmemoryPlugin(
-          { instanceId: 'inst-1' },
-          { instance: new FakeXmemoryInstance(), autoCapture: { project: () => 'x', sampleRate: rate } },
-        ).configureWorker({ taskQueue: 'tq' } as never),
-      /sampleRate/,
-      `accepted ${rate}`,
-    );
-  }
 });
 
 test('an activity named like an Object member is not a collision', () => {

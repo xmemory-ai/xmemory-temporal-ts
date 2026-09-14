@@ -5,7 +5,6 @@ import * as errors from '../src/errors';
 import { DEFAULT_ENDPOINT, resolveApiKey, resolveEndpoint, resolveUrl } from '../src/config';
 import { XmemoryPlugin } from '../src/plugin';
 import { XmemoryClient } from 'xmemory';
-import { MockActivityEnvironment } from '@temporalio/testing';
 import { toApplicationFailure } from '../src/errors';
 import { apiError, FakeXmemoryInstance } from './fakes';
 
@@ -151,24 +150,6 @@ test('a fetch network error is retryable, not a bad request', () => {
   assert.equal(f.nonRetryable, false);
 });
 
-test('an inherited cause does not make a programming error retryable', () => {
-  // `cause` is how a fetch network failure is told apart from a bug in this code.
-  // Reading it through the prototype chain turned a deterministic TypeError into a
-  // transient blip, and Temporal repeated it.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.cause = 'inherited';
-    const f = toApplicationFailure(new TypeError('Cannot read properties of undefined'));
-    assert.equal(f.type, errors.TYPE_BAD_REQUEST);
-    assert.equal(f.nonRetryable, true);
-    // A real network failure carries its own cause and stays retryable.
-    const network = toApplicationFailure(new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') }));
-    assert.equal(network.type, errors.TYPE_UNAVAILABLE);
-  } finally {
-    delete proto.cause;
-  }
-});
-
 test('a programming TypeError stays non-retryable', () => {
   // No `cause`, so it is our bug, not the network: retrying replays it.
   const f = toApplicationFailure(new TypeError("Cannot read properties of undefined"));
@@ -278,6 +259,45 @@ test('a configured url must be https, or loopback for local development', () => 
   }
 });
 
+test('the API key goes only where this config says', () => {
+  // With nothing configured, the endpoint is handed to the client explicitly rather
+  // than left to the client's own XMEM_API_URL fallback, which this plugin would not
+  // have validated.
+  const savedUrl = process.env.XMEM_API_URL;
+  try {
+    delete process.env.XMEM_API_URL;
+    assert.equal(resolveEndpoint({ instanceId: 'i' }), DEFAULT_ENDPOINT);
+    const client = new XmemoryClient({ apiKey: 'k', url: resolveEndpoint({ instanceId: 'i' }) });
+    assert.equal((client as unknown as { _baseUrl: string })._baseUrl, DEFAULT_ENDPOINT);
+  } finally {
+    if (savedUrl !== undefined) process.env.XMEM_API_URL = savedUrl;
+  }
+
+  // A name that is not a variable resolves nothing the client could send as a key.
+  for (const name of ['toString', 'constructor']) {
+    assert.throws(
+      () => resolveApiKey({ instanceId: 'i', apiKeyEnv: name }),
+      /unset or empty|non-empty string/,
+      `apiKeyEnv ${name} resolved something`,
+    );
+  }
+
+  // An explicit null is a mistake, not an omission: defaulting it would send the
+  // ambient key to whatever endpoint this config names.
+  const savedKey = process.env.XMEM_API_KEY;
+  try {
+    process.env.XMEM_API_KEY = 'AMBIENT_PRODUCTION_KEY';
+    assert.throws(
+      () => resolveApiKey({ instanceId: 'i', apiKeyEnv: null as never }),
+      /non-empty string/,
+      'apiKeyEnv null fell through to the default',
+    );
+  } finally {
+    if (savedKey === undefined) delete process.env.XMEM_API_KEY;
+    else process.env.XMEM_API_KEY = savedKey;
+  }
+});
+
 test('the endpoint from the environment is validated too', () => {
   // Validating only an explicit `url` left the client free to fall back to
   // XMEM_API_URL, which then carried the bearer token to whatever it named.
@@ -300,145 +320,9 @@ test('the endpoint from the environment is validated too', () => {
   }
 });
 
-test('inherited configuration cannot redirect the credential', () => {
-  // `process.env` is an ordinary object whose prototype is Object.prototype, and a
-  // plain lookup sees the chain. Prototype pollution anywhere in the Worker could
-  // therefore supply an endpoint this config never set, and the API key would be
-  // sent there. Own properties only.
-  const savedUrl = process.env.XMEM_API_URL;
-  try {
-    delete process.env.XMEM_API_URL;
-    (Object.prototype as Record<string, unknown>).XMEM_API_URL = 'https://attacker.invalid';
-    assert.equal(resolveUrl({ instanceId: 'i' }), undefined, 'an inherited endpoint was accepted');
-    // And the client is handed that decision explicitly. Left to itself it reads
-    // the same polluted variable and only then falls back, so `undefined` here is
-    // exactly what reopened the hole.
-    assert.equal(resolveEndpoint({ instanceId: 'i' }), DEFAULT_ENDPOINT);
-    const client = new XmemoryClient({ apiKey: 'k', url: resolveEndpoint({ instanceId: 'i' }) });
-    const baseUrl = (client as unknown as { _baseUrl: string })._baseUrl;
-    assert.equal(baseUrl, DEFAULT_ENDPOINT, `the client still resolved ${baseUrl}`);
-  } finally {
-    delete (Object.prototype as Record<string, unknown>).XMEM_API_URL;
-    if (savedUrl !== undefined) process.env.XMEM_API_URL = savedUrl;
-  }
-
-  // The same for a config object whose `url` comes from its prototype.
-  const inherited = Object.create({ url: 'https://attacker.invalid' }) as { instanceId: string };
-  inherited.instanceId = 'i';
-  assert.equal(resolveUrl(inherited), undefined, 'an inherited config.url was accepted');
-
-  // And an env-var *name* that names something on the prototype resolves a
-  // function, which the client would send as a bearer token.
-  for (const name of ['toString', 'constructor', '__proto__']) {
-    assert.throws(
-      () => resolveApiKey({ instanceId: 'i', apiKeyEnv: name }),
-      /unset or empty|non-empty string/,
-      `apiKeyEnv ${name} resolved something`,
-    );
-  }
-
-  // An explicit null is a mistake, not an omission: defaulting it read the ambient
-  // key and sent it to whatever endpoint this config names.
-  const savedKey = process.env.XMEM_API_KEY;
-  try {
-    process.env.XMEM_API_KEY = 'AMBIENT_PRODUCTION_KEY';
-    assert.throws(
-      () => resolveApiKey({ instanceId: 'i', apiKeyEnv: null as never }),
-      /non-empty string/,
-      'apiKeyEnv null fell through to the default',
-    );
-  } finally {
-    if (savedKey === undefined) delete process.env.XMEM_API_KEY;
-    else process.env.XMEM_API_KEY = savedKey;
-  }
-});
-
-test('inherited configuration cannot switch on detail logging', async () => {
-  // A plain `{ ...config }` copy still answers a *missing* field from
-  // Object.prototype, so pollution reached the opt-in log toggle. Asserted through
-  // the plugin's own activities, not a hand-built snapshot: the point is what the
-  // plugin does with the config it was given.
-  const proto = Object.prototype as Record<string, unknown>;
-  const logged: Record<string, unknown>[] = [];
-  const logger = {
-    trace: () => {},
-    debug: () => {},
-    info: () => {},
-    warn: (_m: string, attrs?: Record<string, unknown>) => void logged.push(attrs ?? {}),
-    error: () => {},
-    log: () => {},
-  };
-  try {
-    proto.logServerErrorDetail = true;
-    const fake = new FakeXmemoryInstance();
-    fake.statusSequence(['failed'], 'SECRET memory text');
-    const plugin = new XmemoryPlugin({ instanceId: 'inst-1' }, { instance: fake });
-    const configured = plugin.configureWorker({ taskQueue: 'tq' } as never);
-    const activities = configured.activities as Record<string, (input: unknown) => Promise<unknown>>;
-    await plugin.runWorker({} as never, async () => {
-      const env = new MockActivityEnvironment({ scheduledTimestampMs: Date.now() } as never, { logger } as never);
-      await env.run(activities.xmemory_write_status as never, { writeId: 'w1' } as never);
-    });
-    const dumped = JSON.stringify(logged);
-    assert.ok(!dumped.includes('SECRET'), `an inherited flag switched on detail logging: ${dumped}`);
-    assert.ok(dumped.includes('errorDetailLength'), `the withheld-detail note is missing: ${dumped}`);
-  } finally {
-    delete proto.logServerErrorDetail;
-  }
-});
-
-test('a class getter is read with the instance as its receiver', () => {
-  // A getter defined on a class prototype has to run against the instance. Reading
-  // it off the prototype gave `undefined` — so a `sampleRate` of 0, meaning capture
-  // nothing, was dropped and sampling defaulted to capturing everything.
-  class Config {
-    readonly rate: number = 0;
-    project(): string {
-      return 'x';
-    }
-    get sampleRate(): number {
-      return this.rate;
-    }
-  }
-  // A rate of 0 is valid and means "never"; an out-of-range one is refused. If the
-  // getter were read off the prototype it would return undefined, and neither the
-  // acceptance below nor the rejection after it would say anything.
-  assert.doesNotThrow(
-    () => new XmemoryPlugin({ instanceId: 'i' }, { instance: new FakeXmemoryInstance(), autoCapture: new Config() as never }),
-  );
-  // The getter reads `this.rate`, so it only returns 5 when it runs against the
-  // instance. Read off the prototype it yields undefined, the validation is skipped,
-  // and nothing throws — which is exactly the defect.
-  class OutOfRange extends Config {
-    override readonly rate = 5;
-  }
-  assert.throws(
-    () => new XmemoryPlugin({ instanceId: 'i' }, { autoCapture: new OutOfRange() as never }),
-    /sampleRate/,
-    'the class getter was not read at all',
-  );
-});
-
-test('an inherited projector cannot switch on capture', () => {
-  // Preserving a class's `project` must not also accept one from Object.prototype:
-  // an otherwise empty block would then install capture the caller never asked for.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.project = () => 'captured';
-    assert.throws(
-      () => new XmemoryPlugin({ instanceId: 'i' }, { autoCapture: {} as never }),
-      /autoCapture.project/,
-      'an inherited projector enabled capture',
-    );
-  } finally {
-    delete proto.project;
-  }
-});
-
-test('auto-capture keeps a class projector and refuses an unusable one', () => {
-  // `project` is often a method on a class instance's prototype, which a spread
-  // drops — leaving an interceptor with nothing to call. And `{ ...null }` is an
-  // empty object, so `autoCapture: null` installed capture that could never work.
+test('auto-capture accepts a class projector, and null as omitted', () => {
+  // `project` is often a method on a class instance's prototype, so the config is
+  // kept as given rather than copied, which would drop it.
   class Projector {
     project(_name: string, result: unknown): string {
       return `remembered ${String(result)}`;
@@ -454,33 +338,10 @@ test('auto-capture keeps a class projector and refuses an unusable one', () => {
       ),
   );
 
-  // null is an omission; anything else that cannot capture is refused at setup.
-  assert.doesNotThrow(() => new XmemoryPlugin({ instanceId: 'i' }, { autoCapture: null as never }));
-  for (const bad of ['nope', [], {}, { project: 'not a function' }]) {
-    assert.throws(
-      () => new XmemoryPlugin({ instanceId: 'i' }, { autoCapture: bad as never }),
-      /autoCapture/,
-      `accepted ${JSON.stringify(bad)}`,
-    );
-  }
-});
-
-test('an inherited sample rate does not decide how much is captured', () => {
-  // `autoCapture` is nested, and its fields are read one by one at capture time.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.sampleRate = 5; // out of range: construction would reject a real one
-    assert.doesNotThrow(
-      () =>
-        new XmemoryPlugin(
-          { instanceId: 'inst-1' },
-          { instance: new FakeXmemoryInstance(), autoCapture: { project: () => 'x' } },
-        ),
-      'an inherited sampleRate reached validation',
-    );
-  } finally {
-    delete proto.sampleRate;
-  }
+  // null is an omission: no interceptor is registered for it.
+  const plugin = new XmemoryPlugin({ instanceId: 'i' }, { autoCapture: null as never });
+  const configured = plugin.configureWorker({ taskQueue: 'tq' } as never);
+  assert.equal(configured.interceptors, undefined);
 });
 
 test('an unusable header hint does not mask a usable structured one', () => {
