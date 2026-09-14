@@ -238,15 +238,19 @@ Two things keep memory operations correct under retries and replay:
   Activities default to `maximumAttempts: 1` and surface the failure to your
   workflow. Reads and status polls are idempotent and retry generously.
 
-**A structured write is retryable when the mutation names what it addresses.** Pass
-explicit mutations instead of free text and nothing is extracted, so re-applying is
-deterministic — for an `update` or `delete` keyed by primary key. A `create` is not:
-the server assigns the key, so a retry after a lost response inserts a second row.
-Opt into `writeRetryPolicy` for the keyed shapes only:
+**Structured writes are the reliable way to make a write retryable.** Pass
+explicit mutations instead of free text and the primary key is one you supply, so
+nothing is extracted and re-applying the write is deterministic.
+
+Retrying is opted into per handle, through `writeRetryPolicy`, and an opted-in handle
+is no longer at-most-once: every write through it retries, text writes and creates
+included. So give keyed structured writes a handle of their own, and keep the
+default handle for everything else. Always set `maximumAttempts` — Temporal reads an
+omitted one as unlimited.
 
 ```ts
-const mem = xmemoryForWorkflow({ writeRetryPolicy: { maximumAttempts: 3 } });
-await mem.write('', {
+const keyedWrites = xmemoryForWorkflow({ writeRetryPolicy: { maximumAttempts: 3 } });
+await keyedWrites.write('', {
   structuredMutations: [
     {
       object_mutation: {
@@ -257,6 +261,10 @@ await mem.write('', {
   ],
 });
 ```
+
+A mutation is a `create`, `update`, or `delete` on one object or relation. An
+update or delete names the key it addresses, so a retry hits the same row. A create
+does not — the server assigns the key — so a create is not safe to retry.
 
 For text writes, opt into retries only when your primary keys are literal
 identifiers appearing verbatim in the text, such as a `customerId` you supply. That

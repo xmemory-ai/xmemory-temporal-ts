@@ -210,22 +210,6 @@ function buildWriteStatusRetry(retry: WriteStatusRetry | undefined): RetryPolicy
   });
 }
 
-/**
- * A private copy of a retry policy. The caller keeps its own reference and its code
- * runs between our awaits, so a policy validated before the enqueue could be
- * mutated before the first poll was scheduled. Left alone when it is not an object,
- * so validation reports that instead.
- */
-function snapshotPolicy(policy: RetryPolicy): RetryPolicy {
-  if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) return policy;
-  // Copy first, then read from the copy: reading the original would promote an
-  // inherited `nonRetryableErrorTypes` into the snapshot as though it were theirs.
-  const copy = ownOnly({ ...policy });
-  const types = copy.nonRetryableErrorTypes;
-  if (Array.isArray(types)) copy.nonRetryableErrorTypes = [...types];
-  return copy;
-}
-
 export interface WorkflowXmemoryOptions {
   readTimeout?: Duration;
   writeTimeout?: Duration;
@@ -294,8 +278,8 @@ export class WorkflowXmemory {
       writeTimeout: options.writeTimeout ?? DEFAULT_TIMEOUTS.writeMs,
       writeStartTimeout: options.writeStartTimeout ?? DEFAULT_TIMEOUTS.writeStartMs,
       writeStatusTimeout: options.writeStatusTimeout ?? DEFAULT_TIMEOUTS.writeStatusMs,
-      readRetry: snapshotPolicy(options.readRetryPolicy ?? DEFAULT_READ_RETRY),
-      writeRetry: snapshotPolicy(options.writeRetryPolicy ?? DEFAULT_WRITE_RETRY),
+      readRetry: options.readRetryPolicy ?? DEFAULT_READ_RETRY,
+      writeRetry: options.writeRetryPolicy ?? DEFAULT_WRITE_RETRY,
       pollRetry: buildWriteStatusRetry(options.writeStatusRetry),
       totalTimeout: options.totalTimeout,
       // `=== true`, not truthiness: options can be built from config, and the string
@@ -334,7 +318,6 @@ export class WorkflowXmemory {
     text = requireText(text, 'write: text');
     options = requireOptions(options, 'write');
     durationMs(this.opts.writeTimeout, 'write: timeout');
-    this.assertWritePolicy('write');
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.writeTimeout,
       ...this.totalBound(),
@@ -362,7 +345,6 @@ export class WorkflowXmemory {
     text = requireText(text, 'writeAsyncStart: text');
     options = requireOptions(options, 'writeAsyncStart');
     durationMs(this.opts.writeStartTimeout, 'writeAsyncStart: timeout');
-    this.assertWritePolicy('writeAsyncStart');
     const logic = options.extractionLogic;
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.writeStartTimeout,
@@ -535,27 +517,6 @@ export class WorkflowXmemory {
       // last look: the write may still land inside it.
       final = true;
       await sleep(Math.max(0, leftMs));
-    }
-  }
-
-  /**
-   * A write policy has to say how many attempts it wants.
-   *
-   * Writes are at-most-once by default: xmemory assigns primary keys with a model,
-   * so a re-extraction can fork a record. Temporal reads an unset `maximumAttempts`
-   * as unlimited, so a policy omitting it discards that default silently. Opting in
-   * is allowed, it just has to be said. Everything else about a read or write policy
-   * is Temporal's to judge, when it schedules the Activity.
-   */
-  private assertWritePolicy(call: string): void {
-    if (this.opts.writeRetry.maximumAttempts === undefined) {
-      throw applicationFailure({
-        message:
-          `${call}: writeRetryPolicy must set maximumAttempts. Temporal reads an unset value as unlimited ` +
-          'retries, and a retried write can fork a record; pass 1 to keep writes at-most-once.',
-        type: TYPE_BAD_OPTIONS,
-        nonRetryable: true,
-      });
     }
   }
 

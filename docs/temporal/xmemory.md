@@ -120,10 +120,10 @@ For the fire-and-forget pattern — kick off several writes, keep working, join 
 
 Writes default to at-most-once (`maximumAttempts: 1`). xmemory assigns primary keys with a model, and that assignment is non-deterministic — a re-extraction can normalize the same value differently (`Dr. Robert Kim` vs `Robert Kim`) and fork the record — so a lost-response retry could duplicate. A failed write surfaces to your Workflow, which decides to retry, compensate, or fail. Reads and status-polls are idempotent and retry freely.
 
-Opt into write retries only when your primary keys are literal identifiers present verbatim in the text, such as a `customerId` or `interactionId` you supply, which re-extract deterministically:
+Opt into write retries only when your primary keys are literal identifiers present verbatim in the text, such as a `customerId` or `interactionId` you supply, which re-extract deterministically. The policy applies per handle, so every write through an opted-in handle retries; keep those writes on a handle of their own:
 
 ```ts
-const mem = xmemoryForWorkflow({ writeRetryPolicy: { maximumAttempts: 3 } });
+const keyedWrites = xmemoryForWorkflow({ writeRetryPolicy: { maximumAttempts: 3 } });
 ```
 
 ## Handle errors with typed failures

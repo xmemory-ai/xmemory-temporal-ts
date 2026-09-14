@@ -26,12 +26,9 @@ import {
   badWriteStatusRetryWorkflow,
   noTextDurableWriteWorkflow,
   pollutedPolicyDurableWriteWorkflow,
-  pollutedWritePolicyWorkflow,
   nonStringWriteIdWorkflow,
   stringSummaryFlagWorkflow,
   optionsOverrideTextWorkflow,
-  typoWritePolicyWorkflow,
-  unboundedWritePolicyWorkflow,
   nullOptionsWorkflow,
   totalBoundedDurableWriteWorkflow,
   tunedPollDurableWriteWorkflow,
@@ -496,25 +493,6 @@ test('a non-string text or query is refused before anything is scheduled', async
   }
 });
 
-test('an inherited retry-type list is not promoted into a caller policy', async () => {
-  // Read and write policies are still the caller's own objects, copied by
-  // `snapshotPolicy` — which copies first and reads the copy, so an inherited
-  // `nonRetryableErrorTypes` cannot be pulled in and then look like theirs. Here it
-  // would turn a retryable server error terminal and stop the opted-in retry.
-  const fake = new FakeXmemoryInstance();
-  fake.failWriteTimes(1, apiError({ status: 500, code: 'INTERNAL_ERROR' }));
-  const w = await worker(fake);
-  const writeId = await w.runUntil(
-    env.client.workflow.execute(pollutedWritePolicyWorkflow, {
-      taskQueue: TASK_QUEUE,
-      workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-      args: ['remember'],
-    }),
-  );
-  assert.equal(writeId, 'w1');
-  assert.equal(fake.count('write'), 2, 'the retryable server error was treated as terminal');
-});
-
 test('an inherited retry-type list is not promoted into the built poll policy', async () => {
   // The policy this package builds is a plain object, so it inherits from
   // Object.prototype unless copied onto a null one. An inherited
@@ -651,43 +629,6 @@ test('an options object cannot replace the text argument', async () => {
     }),
   );
   assert.equal(fake.calls[0]?.textOrQuery, 'INTENDED', 'the options object replaced the caller"s text');
-});
-
-test('a write policy that does not say how many attempts is refused', async () => {
-  // `maximumAttempt` (singular) is ignored by Temporal, which then reads the policy
-  // as unlimited retries — silently discarding the at-most-once default on the one
-  // call that is not idempotent.
-  const fake = new FakeXmemoryInstance();
-  const w = await worker(fake);
-  await assert.rejects(
-    () =>
-      w.runUntil(
-        env.client.workflow.execute(typoWritePolicyWorkflow, {
-          taskQueue: TASK_QUEUE,
-          workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          args: [],
-        }),
-      ),
-    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-  );
-  assert.equal(fake.count('write'), 0, 'wrote under a policy that had lost its attempt limit');
-
-  // The same rule with no typo to catch it: every field is valid, and the policy
-  // still says nothing about attempts, which Temporal reads as unlimited.
-  const plain = new FakeXmemoryInstance();
-  const w2 = await worker(plain);
-  await assert.rejects(
-    () =>
-      w2.runUntil(
-        env.client.workflow.execute(unboundedWritePolicyWorkflow, {
-          taskQueue: TASK_QUEUE,
-          workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          args: [],
-        }),
-      ),
-    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-  );
-  assert.equal(plain.count('write'), 0, 'wrote under an unbounded write policy');
 });
 
 test('options arriving as null are treated as omitted', async () => {
