@@ -1,6 +1,6 @@
 {
   "name": "@xmemory/temporal",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Temporal plugin for xmemory \u2014 durable agent memory as Temporal Activities",
   "license": "MIT",
   "repository": {
