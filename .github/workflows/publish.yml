@@ -1,9 +1,11 @@
 name: publish
 
-# Publishes @xmemory/temporal to npm when a GitHub Release is published.
-# No token is required today — add one before the first release (see below).
+# Publishes @xmemory/temporal to npm. Start it from the Actions tab: publish → Run
+# workflow, on `main`. The version comes from package.json, so bump it (and
+# package-lock.json) in a PR first. Once npm has the package, the commit is tagged
+# v<version> and a GitHub Release is created with generated notes.
 #
-# Three jobs, each holding as little as it needs:
+# Four jobs, each holding as little as it needs:
 #
 # * `pack` builds the artifact that will be published, from a `--ignore-scripts`
 #   install, and runs no third-party executable. The integration tests download and
@@ -14,16 +16,26 @@ name: publish
 #   and produces nothing that ships.
 # * `npm` publishes the exact tarball `pack` produced, only if `verify` passed. It
 #   installs nothing, so no dependency code runs in the job holding the credential.
+# * `release` tags the commit and creates the GitHub Release, only once `npm` has
+#   published. It checks nothing out and runs no repository code.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# One release at a time: a second run queues instead of racing the first to the tag.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   pack:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dist_tag: ${{ steps.version.outputs.dist_tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -36,29 +48,44 @@ jobs:
       - name: Install (locked, no install hooks)
         # `prepare` is skipped along with everything else, so the build is explicit.
         run: npm ci --ignore-scripts
-      - name: Check the release commit is on main
-        # A Release can be cut from any commit, and anyone with write access can
-        # publish one — so without this, a tag on a side branch reaches the npm
-        # credential. `compare` reports `behind` or `identical` when the commit is an
-        # ancestor of main. Protect the `v*` tags and require a deployment reviewer
-        # on the `npm` environment as well; neither is expressible in this file.
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check the run is on main
+        # "Run workflow" accepts any branch or tag, and anyone with write access can
+        # start it — so without this, a side branch reaches the npm credential. The
+        # `npm` environment also accepts only main and requires a reviewer; neither
+        # is expressible in this file.
         run: |
-          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
-          case "$status" in
-            behind|identical) echo "release commit is on main ($status)" ;;
-            *) echo "refusing to publish ${GITHUB_SHA}: not an ancestor of main ($status)"; exit 1 ;;
+          test "$GITHUB_REF" = refs/heads/main || {
+            echo "refusing to publish from $GITHUB_REF: run this workflow on main"; exit 1; }
+      - name: Read the version and its dist-tag
+        id: version
+        # The dist-tag is explicit, or npm's default would make `1.0.0-rc.1` the
+        # version `npm install` resolves. SemVer is what defines a prerelease, so it
+        # comes from the version alone. Build metadata first: `1.0.0+build-1` is a
+        # stable release whose `+` component may itself contain a hyphen. Only what
+        # precedes it decides.
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          case "${version%%+*}" in
+            *-*) dist_tag=next; prerelease=true ;;
+            *)   dist_tag=latest; prerelease=false ;;
           esac
-      - name: Check the release tag matches package.json
-        # A mismatch here publishes a version nobody tagged, or fails after the
-        # release is already announced.
+          {
+            echo "version=$version"
+            echo "dist_tag=$dist_tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing $version under dist-tag $dist_tag"
+      - name: Check the version is not released yet
+        # npm accepts a version only once, so stop now rather than after the
+        # deployment is approved.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          pkg="$(node -p 'require("./package.json").version')"
-          # `v$pkg` exactly, not a stripped prefix: `0.1.0` would otherwise pass here
-          # while falling outside the `v*` tag protection rule.
-          test "$GITHUB_REF_NAME" = "v$pkg" || {
-            echo "tag $GITHUB_REF_NAME is not v$pkg (the packaged version)"; exit 1; }
+          tagged="$(git ls-remote --tags origin "refs/tags/v$VERSION")"
+          test -z "$tagged" || { echo "v$VERSION is already tagged: bump the version first"; exit 1; }
+          status="$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/@xmemory%2ftemporal/$VERSION")"
+          test "$status" = 404 || {
+            echo "npm answered $status for @xmemory/temporal@$VERSION, not 404: already published, or npm is unreachable"; exit 1; }
       - name: Build
         run: npm run build
       - name: Pack
@@ -179,19 +206,12 @@ jobs:
           path: pack
       - name: Publish to npm
         # The tarball itself, so what is published is what was built and checked.
-        # `--provenance` requires id-token: write and a PUBLIC source repo — flip
-        # this repo public before the first release (Phase C), or drop the flag.
+        # `--provenance` requires id-token: write and a public source repo.
         # `--access public` is required for a scoped (@xmemory) package.
         # --ignore-scripts: nothing in this job should execute package code.
-        # The dist-tag is explicit: this workflow fires for prereleases too, and
-        # npm's default would make `1.0.0-rc.1` the version `npm install` resolves.
-        #
-        # Taken from the version itself, not from the Release checkbox: SemVer is
-        # what defines a prerelease, and the checkbox is a separate field a release
-        # author can forget. A disagreement between them is a mistake either way, so
-        # it stops the publish rather than picking a winner.
         env:
-          PRERELEASE_FLAG: ${{ github.event.release.prerelease }}
+          VERSION: ${{ needs.pack.outputs.version }}
+          DIST_TAG: ${{ needs.pack.outputs.dist_tag }}
           # TOKEN: set the NPM_TOKEN secret (a granular access token) before the
           # first release.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -200,17 +220,27 @@ jobs:
           # The same digest `pack` recorded, checked once more in the job that holds
           # the credential — nothing here has run any packaged or dependency code.
           sha256sum --check SHA256SUMS
-          version="${GITHUB_REF_NAME#v}"
-          # Build metadata first: `1.0.0+build-1` is a stable release whose `+`
-          # component may itself contain a hyphen. Only what precedes it decides.
-          case "${version%%+*}" in
-            *-*) dist_tag=next; is_prerelease=true ;;
-            *)   dist_tag=latest; is_prerelease=false ;;
-          esac
-          if [ "$PRERELEASE_FLAG" != "$is_prerelease" ]; then
-            echo "version $version says prerelease=$is_prerelease, the Release says $PRERELEASE_FLAG"
-            echo "fix whichever is wrong and re-run; refusing to guess which tag to publish under"
-            exit 1
-          fi
-          echo "publishing $version under dist-tag $dist_tag"
-          npm publish "$(ls ./*.tgz)" --tag "$dist_tag" --provenance --access public --ignore-scripts
+          # The tarball is named after the version inside it, so this proves the
+          # version `pack` checked and tags is the one being published.
+          tarball="xmemory-temporal-$VERSION.tgz"
+          test -f "$tarball" || { echo "expected $tarball, the artifact holds: $(ls ./*.tgz)"; exit 1; }
+          echo "publishing $VERSION under dist-tag $DIST_TAG"
+          npm publish "./$tarball" --tag "$DIST_TAG" --provenance --access public --ignore-scripts
+
+  # Runs only after npm has the package, so a failed publish leaves no tag behind. If
+  # this job alone fails, use "Re-run failed jobs": a new run stops at the
+  # not-released check, because npm already has the version.
+  release:
+    needs: [pack, npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Tag the commit and create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.pack.outputs.version }}
+          PRERELEASE: ${{ needs.pack.outputs.prerelease }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --generate-notes --prerelease="$PRERELEASE"
