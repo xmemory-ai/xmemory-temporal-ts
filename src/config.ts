@@ -8,13 +8,6 @@
 
 export const DEFAULT_API_KEY_ENV = 'XMEM_API_KEY';
 
-/**
- * An *own* property, or `undefined`. `process.env` is an ordinary object, so a
- * plain lookup can return an endpoint or key that was never set.
- */
-function own(source: object, key: string): unknown {
-  return Object.hasOwn(source, key) ? (source as Record<string, unknown>)[key] : undefined;
-}
 // The client falls back to this when no url is passed, so it is an endpoint source
 // this plugin must validate too.
 const URL_ENV = 'XMEM_API_URL';
@@ -62,14 +55,14 @@ export function resolveApiKey(config: XmemoryConfig, override?: string): string 
     return override;
   }
   // Defaulted only when genuinely absent: `??` would treat an own `null` as one.
-  const configured = own(config, 'apiKeyEnv');
+  const configured = config.apiKeyEnv;
   const varName = configured === undefined ? DEFAULT_API_KEY_ENV : configured;
   if (typeof varName !== 'string' || varName === '') {
     throw new Error(
       `xmemory apiKeyEnv must be a non-empty string, got ${varName === null ? 'null' : typeof varName}`,
     );
   }
-  const key = own(process.env, varName);
+  const key = process.env[varName];
   if (typeof key !== 'string' || key === '') {
     throw new Error(
       `xmemory API key not found: environment variable ${JSON.stringify(varName)} is unset or empty. ` +
@@ -93,11 +86,11 @@ export function resolveEndpoint(config: XmemoryConfig): string {
 
 /** Validate the effective endpoint, or `undefined` when none was supplied. */
 export function resolveUrl(config: XmemoryConfig): string | undefined {
-  const configured = own(config, 'url');
+  const configured = config.url;
   if (configured !== undefined) return validateEndpoint(configured, 'xmemory url');
   // With `url` unset the client falls back to this variable, which would then reach
   // the wire unchecked. Resolving it here makes this the only path to an endpoint.
-  const fromEnv = own(process.env, URL_ENV);
+  const fromEnv = process.env[URL_ENV];
   if (fromEnv === undefined) return undefined;
   return validateEndpoint(fromEnv, `$${URL_ENV}`);
 }

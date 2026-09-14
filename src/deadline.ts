@@ -1,5 +1,3 @@
-import { MAX_DURATION_MS } from './defaults';
-
 /**
  * A total wall-clock bound for a client call.
  *
@@ -13,12 +11,8 @@ export class DeadlineExceededError extends Error {
   }
 }
 
+/** `ms` is a client budget, already positive and capped by `clientTimeoutMs`. */
 export function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
-  // Refused rather than passed to setTimeout, which turns anything above 2**31-1
-  // into 1ms — the deadline would fire immediately instead of never.
-  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_DURATION_MS) {
-    return Promise.reject(new RangeError(`xmemory client deadline must be 1..${MAX_DURATION_MS}ms, got ${ms}`));
-  }
   let timer: ReturnType<typeof setTimeout>;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new DeadlineExceededError(ms)), ms);

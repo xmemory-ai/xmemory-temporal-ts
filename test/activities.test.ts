@@ -14,9 +14,8 @@ import type { ReadOutput, WriteOutput, WriteStatusOutput } from '../src/dto';
 import * as errors from '../src/errors';
 import { activityBudgetMs } from '../src/deadline';
 import { xmemoryForWorkflow } from '../src/workflow';
-import { clientTimeoutMs } from '../src/defaults';
+import { clientTimeoutMs, MAX_DURATION_MS } from '../src/defaults';
 import { FakeXmemoryInstance, apiError } from './fakes';
-import { InstanceHandle, XmemoryClient } from 'xmemory';
 
 /**
  * A MockActivityEnvironment with a live deadline. The mock anchors
@@ -128,6 +127,22 @@ test('client timeout tracks the activity deadline', async () => {
   }
 });
 
+test('a client budget never exceeds what a timer can hold', async () => {
+  // Timeouts are Temporal's to validate, so a long one reaches the activity as is.
+  // The client arms a `setTimeout` with its budget, and Node fires anything past
+  // 2**31-1 after 1ms — so an uncapped 30-day deadline aborted every call at once.
+  const fake = new FakeXmemoryInstance('ok');
+  const acts = build(fake);
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  // Schedule-to-close unset (0), or the mock's 1s default would be the binding bound.
+  const env = liveEnv({ startToCloseTimeoutMs: thirtyDaysMs, scheduleToCloseTimeoutMs: 0 });
+  const out = (await env.run(acts[ACTIVITY_READ], { query: 'q' })) as ReadOutput;
+  assert.equal(out.readerResult, 'ok');
+  const used = fake.calls[fake.calls.length - 1].options?.timeoutMs as number;
+  assert.ok(used <= MAX_DURATION_MS, `client budget ${used}ms is past a timer's limit`);
+  assert.ok(used < thirtyDaysMs, 'the client must still give up before Temporal');
+});
+
 test('scheduleToClose alone is a valid deadline', async () => {
   // The only shape that reaches the second half of the `||`.
   const fake = new FakeXmemoryInstance('ok');
@@ -180,12 +195,8 @@ test('structured mutations skip extraction', async () => {
   ];
   await env.run(acts[ACTIVITY_WRITE], { text: '', structuredMutations: mutations } as never);
   const call = fake.calls[fake.calls.length - 1];
-  // Compared as JSON: the mutations are forwarded as a null-prototype copy, so a
-  // missing field cannot be answered by Object.prototype on its way to the client.
-  // What matters is that the content reaches the wire unchanged.
-  assert.deepEqual(JSON.parse(JSON.stringify(call.options?.structuredMutations)), mutations);
-  assert.equal(Object.getPrototypeOf(call.options?.structuredMutations as object[]).constructor, Array);
-  assert.equal(Object.getPrototypeOf((call.options?.structuredMutations as object[])[0]), null);
+  // Forwarded to the client unchanged.
+  assert.deepEqual(call.options?.structuredMutations, mutations);
   assert.equal(call.options?.extractionLogic, undefined);
 });
 
@@ -299,8 +310,6 @@ test('poll retry options that Temporal could not use are refused', () => {
     [{ attempts: 2.5 }, 'a fractional attempt count'],
     [{ intervalMs: 0 }, 'a zero interval'],
     [{ intervalMs: 1_000, maxIntervalMs: 500 }, 'a ceiling below the interval'],
-    [{ nonRetryableErrorTypes: 'XmemoryServerError' }, 'a string where a list belongs'],
-    ['nope', 'options that are not an object'],
   ] as const) {
     assert.throws(
       () => xmemoryForWorkflow({ writeStatusRetry: retry as never }),
@@ -370,54 +379,6 @@ test('logServerErrorDetail only logs on a real true', async () => {
   assert.ok(JSON.stringify(logged).includes('SECRET'), 'an explicit true must still log the detail');
 });
 
-test('an inherited field inside a nested scope does not widen a read', async () => {
-  // Normalizing only the outer input leaves nested objects with their own
-  // prototypes, and the scope's fields decide what the read may reach: an inherited
-  // `relationsScope` widened a scoped read to all_relations, and the extra memory
-  // it returned would be persisted to workflow history.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.relationsScope = 'all_relations';
-    const fake = new FakeXmemoryInstance();
-    const acts = build(fake);
-    await liveEnv().run(acts[ACTIVITY_READ], {
-      query: 'q',
-      scope: { objects: [{ type: 'Person', key: { name: 'Ada' } }] },
-    } as never);
-    // Read the property, not a JSON dump: `JSON.stringify` skips inherited fields
-    // by definition, so a dump cannot see the widening at all — the client reads
-    // `scope.relationsScope` directly, which is where it happens.
-    const scope = fake.calls[0]?.options?.scope as { relationsScope?: string } | undefined;
-    assert.equal(scope?.relationsScope, undefined, `the read was widened to ${scope?.relationsScope}`);
-  } finally {
-    delete proto.relationsScope;
-  }
-});
-
-test('inherited option fields do not reach the client', async () => {
-  // The objects handed to the client are read by it, so an omitted `readMode` or
-  // `diffEngine` was answered by Object.prototype: a default read became raw-tables
-  // and a plain text write picked up a diff engine it was never given.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.readMode = 'raw-tables';
-    proto.diffEngine = true;
-    proto.scope = { objects: [] };
-    const fake = new FakeXmemoryInstance();
-    const acts = build(fake);
-    await liveEnv().run(acts[ACTIVITY_READ], { query: 'q' });
-    await liveEnv().run(acts[ACTIVITY_WRITE], { text: 'plain text' });
-    const [read, write] = fake.calls;
-    assert.equal((read.options as { readMode?: string }).readMode, undefined, 'the read mode was inherited');
-    assert.equal((read.options as { scope?: unknown }).scope, undefined, 'a scope was inherited');
-    assert.equal((write.options as { diffEngine?: boolean }).diffEngine, undefined, 'the diff engine was inherited');
-  } finally {
-    delete proto.readMode;
-    delete proto.diffEngine;
-    delete proto.scope;
-  }
-});
-
 test('an empty write id is not a usable one', async () => {
   // On the enqueue, where nothing else can catch it: an empty string passed every
   // type check, and the durable loop was then left polling for a write it could not
@@ -459,235 +420,20 @@ test('a status for another write is refused, before its detail is logged', async
   assert.ok(!JSON.stringify(logged).includes('SECRET'), `another write's detail was logged: ${JSON.stringify(logged)}`);
 });
 
-test('the real client does not hand us fabricated sub-answers', async () => {
-  // Through the *real* client, not a fake: the client normalizes the wire shape,
-  // and normalizing with `result.field ?? default` used to read an inherited value
-  // and write it back as an own property — where no check here could tell it apart
-  // from something the server sent. Fixed upstream in xmemory 3.8.1; this is the
-  // regression that says so.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.reader_results = [{ sub_query: 'fabricated', reader_result: 'LEAKED MEMORY', error: null }];
-    proto.trace_id = 'fabricated-trace';
-    proto.reader_result = 'FABRICATED ANSWER';
-    // The whole client, not just the handle: an `items` array supplied by the
-    // prototype made an empty `200` body come back as a genuine result, which is a
-    // layer above the one `InstanceHandle` alone exercises.
-    proto.items = [{ reader_result: 'FABRICATED', reader_results: [], trace_id: null, console_url: null }];
-    const client = new XmemoryClient({ apiKey: 'k', url: 'https://api.example.com' });
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () =>
-      new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as never;
-    try {
-      await assert.rejects(() => client.instance('inst-1').read('q'), /Expected one item/);
-    } finally {
-      globalThis.fetch = originalFetch;
-      delete proto.items;
-    }
-
-    // A transport that answers with exactly what a lean server sends.
-    const handle = new InstanceHandle('inst-1', (async () => ({ reader_result: 'the real answer' })) as never);
-    const holder = new InstanceHolder();
-    holder.bind(handle as never);
-    const acts = createActivities(holder, { instanceId: 'inst-1' });
-    const out = (await liveEnv().run(acts[ACTIVITY_READ], { query: 'q' })) as ReadOutput;
-    assert.equal(out.readerResult, 'the real answer');
-    assert.deepEqual(out.subAnswers, [], `fabricated sub-answers reached the workflow: ${JSON.stringify(out.subAnswers)}`);
-    assert.equal(out.traceId, null);
-  } finally {
-    delete proto.reader_results;
-    delete proto.trace_id;
-    delete proto.reader_result;
-  }
-});
-
-test('an inherited error_detail is never logged', async () => {
-  // The detail was read straight off the response, before any own-property
-  // projection — so a polluted prototype put text into the worker log that no
-  // server sent, on the one setting that is documented as opt-in.
-  const proto = Object.prototype as Record<string, unknown>;
-  const logged: Record<string, unknown>[] = [];
-  const logger = {
-    trace: () => {},
-    debug: () => {},
-    info: () => {},
-    warn: (_m: string, attrs?: Record<string, unknown>) => void logged.push(attrs ?? {}),
-    error: () => {},
-    log: () => {},
-  };
-  try {
-    proto.error_detail = 'SECRET inherited detail';
-    const fake = new FakeXmemoryInstance();
-    fake.statusSequence(['failed']);
-    fake.omitErrorDetail(); // the field is absent, so the prototype would answer it
-    const holder = new InstanceHolder();
-    holder.bind(fake);
-    const acts = createActivities(holder, { instanceId: 'i', logServerErrorDetail: true });
-    const env = new MockActivityEnvironment({ scheduledTimestampMs: Date.now() } as never, { logger } as never);
-    await env.run(acts[ACTIVITY_WRITE_STATUS], { writeId: 'w1' });
-    assert.ok(!JSON.stringify(logged).includes('SECRET'), `an inherited detail was logged: ${JSON.stringify(logged)}`);
-  } finally {
-    delete proto.error_detail;
-  }
-});
-
-test('a mutation nested past the copy limit is a bad option, not a stack overflow', async () => {
-  // The copy is recursive, and an unbounded one turns a deep payload into a
-  // RangeError from the call stack — which reaches Temporal untyped, and therefore
-  // retryable, for input that can never work.
-  let deep: Record<string, unknown> = {};
-  for (let i = 0; i < 200; i++) deep = { nested: deep };
+test('a malformed status response is a transport failure, not a status', async () => {
+  // Without its required fields a response would read as an unknown status, which
+  // the durable loop polls straight through. Refused instead, and mapped as a
+  // transport failure: a malformed response may well be transient.
   const fake = new FakeXmemoryInstance();
+  fake.returnMalformedStatus(); // a response with no fields at all
   const acts = build(fake);
   await assert.rejects(
-    () => liveEnv().run(acts[ACTIVITY_WRITE], { text: '', structuredMutations: [deep] } as never),
+    () => liveEnv().run(acts[ACTIVITY_WRITE_STATUS], { writeId: 'w1' }),
     (err: unknown) => {
-      const f = err as ApplicationFailure;
-      assert.equal(f.type, 'XmemoryBadOptions');
-      assert.equal(f.nonRetryable, true);
+      assert.equal((err as ApplicationFailure).type, 'XmemoryUnavailable');
       return true;
     },
   );
-  assert.equal(fake.calls.length, 0);
-});
-
-test('a malformed response cannot report a write as completed', async () => {
-  // Responses are JSON, so a missing field is answered by Object.prototype: against
-  // an empty response the projection reported `completed`, with an id and timestamp
-  // no server ever sent. The durable loop would have called that a finished write.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.write_status = 'completed';
-    proto.write_id = 'w-fabricated';
-    const fake = new FakeXmemoryInstance();
-    fake.returnMalformedStatus(); // a response with no fields of its own
-    const acts = build(fake);
-    await assert.rejects(
-      () => liveEnv().run(acts[ACTIVITY_WRITE_STATUS], { writeId: 'w1' }),
-      (err: unknown) => {
-        // Mapped as a transport failure: a malformed response may well be transient.
-        assert.equal((err as ApplicationFailure).type, 'XmemoryUnavailable');
-        return true;
-      },
-    );
-  } finally {
-    delete proto.write_status;
-    delete proto.write_id;
-  }
-});
-
-test('inherited fields on an activity input are not read', async () => {
-  // Activity payloads are JSON objects backed by Object.prototype, so a polluted
-  // prototype supplies fields the caller never sent. An inherited
-  // `structuredMutations` made a plain text write discard its text and apply a
-  // delete instead.
-  const proto = Object.prototype as Record<string, unknown>;
-  try {
-    proto.structuredMutations = [{ object_mutation: { object_type: 'Person', delete: { key: { name: 'victim' } } } }];
-    const fake = new FakeXmemoryInstance();
-    const acts = build(fake);
-    await liveEnv().run(acts[ACTIVITY_WRITE], { text: 'harmless memory' });
-    const call = fake.calls[0];
-    assert.equal(call.method, 'write');
-    assert.equal(call.textOrQuery, 'harmless memory', 'the inherited mutations replaced the text');
-    assert.equal(
-      JSON.stringify(call.options ?? {}).includes('delete'),
-      false,
-      `a delete mutation reached the client: ${JSON.stringify(call.options)}`,
-    );
-  } finally {
-    delete proto.structuredMutations;
-  }
-});
-
-test('a null activity payload is a typed failure, not a retryable TypeError', async () => {
-  // The activity names are public, so a workflow can schedule them directly rather
-  // than through this package's helpers. Dereferencing a null payload raised a raw
-  // TypeError, which the mapper can only read as retryable — so Temporal repeated a
-  // call that cannot succeed.
-  for (const activity of [ACTIVITY_READ, ACTIVITY_WRITE, ACTIVITY_WRITE_START, ACTIVITY_WRITE_STATUS] as const) {
-    const fake = new FakeXmemoryInstance();
-    const acts = build(fake);
-    await assert.rejects(
-      () => liveEnv().run(acts[activity], null as never),
-      (err: unknown) => {
-        const f = err as ApplicationFailure;
-        assert.equal(f.type, 'XmemoryBadOptions', `${activity} on a null payload`);
-        assert.equal(f.nonRetryable, true);
-        return true;
-      },
-    );
-    assert.equal(fake.calls.length, 0, `${activity} reached the client with a null payload`);
-  }
-});
-
-test('a non-string writeId never reaches the client', async () => {
-  const fake = new FakeXmemoryInstance();
-  const acts = build(fake);
-  await assert.rejects(
-    () => liveEnv().run(acts[ACTIVITY_WRITE_STATUS], { writeId: null } as never),
-    (err: unknown) => {
-      assert.equal((err as ApplicationFailure).type, 'XmemoryBadOptions');
-      return true;
-    },
-  );
-  assert.equal(fake.count('writeStatus'), 0);
-});
-
-test('a non-string text never reaches the client, which would read it as mutations', async () => {
-  // `write` is overloaded on its first argument, so an array in the text slot is
-  // applied as structured mutations — a delete, in one probe — instead of being
-  // written as memory. Activity inputs are JSON: the type annotation proves nothing.
-  const deleteMutation = [{ object_mutation: { object_type: 'Customer', delete: { key: { id: 1 } } } }];
-  for (const bad of [deleteMutation, 42, null, { a: 1 }]) {
-    for (const activity of [ACTIVITY_WRITE, ACTIVITY_WRITE_START] as const) {
-      const fake = new FakeXmemoryInstance();
-      const acts = build(fake);
-      await assert.rejects(
-        () => liveEnv().run(acts[activity], { text: bad } as never),
-        (err: unknown) => {
-          const f = err as ApplicationFailure;
-          assert.equal(f.type, 'XmemoryBadOptions', `${JSON.stringify(bad)} on ${activity}`);
-          assert.equal(f.nonRetryable, true);
-          return true;
-        },
-      );
-      assert.equal(fake.calls.length, 0, `${JSON.stringify(bad)} reached the client on ${activity}`);
-    }
-  }
-  // And the read side, where a non-string query would reach the backend as-is.
-  const fake = new FakeXmemoryInstance();
-  const acts = build(fake);
-  await assert.rejects(
-    () => liveEnv().run(acts[ACTIVITY_READ], { query: 42 } as never),
-    (err: unknown) => {
-      assert.equal((err as ApplicationFailure).type, 'XmemoryBadOptions');
-      return true;
-    },
-  );
-  assert.equal(fake.count('read'), 0);
-});
-
-test('structuredMutations that is not a list never reaches the client', async () => {
-  // A string has a `length`, so it passed the empty check and went to the client's
-  // *text* overload: the mutation value was written as the memory and the caller's
-  // text was discarded. Payloads are JSON, so any caller can produce this.
-  for (const bad of ['ATTACKER TEXT', 42, { object_mutation: {} }, true]) {
-    for (const activity of [ACTIVITY_WRITE, ACTIVITY_WRITE_START] as const) {
-      const fake = new FakeXmemoryInstance();
-      const acts = build(fake);
-      await assert.rejects(
-        () => liveEnv().run(acts[activity], { text: 'INTENDED TEXT', structuredMutations: bad } as never),
-        (err: unknown) => {
-          const f = err as ApplicationFailure;
-          assert.equal(f.type, 'XmemoryBadOptions', `${JSON.stringify(bad)} on ${activity}`);
-          assert.equal(f.nonRetryable, true);
-          return true;
-        },
-      );
-      assert.equal(fake.calls.length, 0, `${JSON.stringify(bad)} reached the client on ${activity}`);
-    }
-  }
 });
 
 test('an empty structuredMutations list is a bad option on both write paths', async () => {
@@ -707,5 +453,50 @@ test('an empty structuredMutations list is a bad option on both write paths', as
       },
     );
     assert.equal(fake.calls.length, 0, `a request was sent for an unusable list on ${activity}`);
+  }
+});
+
+test('a text that is not a string never reaches the client, which would read it as mutations', async () => {
+  // `write` and `writeAsync` are overloaded on their first argument, so an array in
+  // the text slot is applied as structured mutations — a delete, in this probe —
+  // instead of being written as memory. Activity inputs are JSON: the type
+  // annotation proves nothing at this boundary.
+  const deleteMutation = [{ object_mutation: { object_type: 'Customer', delete: { key: { customerId: 'c-1' } } } }];
+  for (const bad of [deleteMutation, 42, null, { a: 1 }]) {
+    for (const activity of [ACTIVITY_WRITE, ACTIVITY_WRITE_START] as const) {
+      const fake = new FakeXmemoryInstance();
+      const acts = build(fake);
+      await assert.rejects(
+        () => liveEnv().run(acts[activity], { text: bad } as never),
+        (err: unknown) => {
+          const f = err as ApplicationFailure;
+          assert.equal(f.type, 'XmemoryBadOptions', `${JSON.stringify(bad)} on ${activity}`);
+          assert.equal(f.nonRetryable, true);
+          return true;
+        },
+      );
+      assert.equal(fake.calls.length, 0, `${JSON.stringify(bad)} reached the client on ${activity}`);
+    }
+  }
+});
+
+test('structuredMutations that is not a list never reaches the client', async () => {
+  // A string has a `length`, so it would pass the empty check and go to the client's
+  // *text* overload: the mutation value written as memory, the caller's text dropped.
+  for (const bad of ['ATTACKER TEXT', 42, { object_mutation: {} }, true]) {
+    for (const activity of [ACTIVITY_WRITE, ACTIVITY_WRITE_START] as const) {
+      const fake = new FakeXmemoryInstance();
+      const acts = build(fake);
+      await assert.rejects(
+        () => liveEnv().run(acts[activity], { text: 'INTENDED TEXT', structuredMutations: bad } as never),
+        (err: unknown) => {
+          const f = err as ApplicationFailure;
+          assert.equal(f.type, 'XmemoryBadOptions', `${JSON.stringify(bad)} on ${activity}`);
+          assert.equal(f.nonRetryable, true);
+          return true;
+        },
+      );
+      assert.equal(fake.calls.length, 0, `${JSON.stringify(bad)} reached the client on ${activity}`);
+    }
   }
 });

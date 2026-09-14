@@ -29,7 +29,7 @@ import {
 // The workflow owns every activity budget: what is set here is what Temporal
 // enforces AND what each activity derives its client timeout from, so the two
 // can never disagree. `DEFAULT_TIMEOUTS` is only the source of the numbers.
-import { applicationFailure, DEFAULT_TIMEOUTS, MAX_DURATION_MS, ownOnly } from './defaults';
+import { DEFAULT_TIMEOUTS, MAX_DURATION_MS } from './defaults';
 import type {
   ReadMode,
   ReadInput,
@@ -84,7 +84,7 @@ function durationMs(value: Duration, label: string): number {
   try {
     ms = msToNumber(value);
   } catch (err) {
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `${label} is not a valid duration: ${String(err)}`,
       type: TYPE_BAD_OPTIONS,
       nonRetryable: true,
@@ -93,50 +93,13 @@ function durationMs(value: Duration, label: string): number {
   // `< 1`, not `<= 0`: Temporal truncates a sub-millisecond duration to zero, and a
   // zeroed startToClose falls back to the default schedule-to-close — ten years.
   if (!Number.isFinite(ms) || ms < 1 || ms > MAX_DURATION_MS) {
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `${label} must be between 1 and ${MAX_DURATION_MS}ms, got ${ms}`,
       type: TYPE_BAD_OPTIONS,
       nonRetryable: true,
     });
   }
   return ms;
-}
-
-/**
- * The caller's options as a null-prototype copy, or a non-retryable failure.
- *
- * `null` means omitted, which is what JSON produces. Anything else that is not a
- * plain object is a mistake: `ownOnly` would *box* a string or array into an object
- * with no recognisable fields, and every option would fall back to its default.
- */
-function requireOptions<T extends object>(options: T | null | undefined, label: string): T {
-  if (options === null || options === undefined) return ownOnly({} as T);
-  if (typeof options !== 'object' || Array.isArray(options)) {
-    throw applicationFailure({
-      message: `${label} options must be an object, got ${Array.isArray(options) ? 'an array' : typeof options}`,
-      type: TYPE_BAD_OPTIONS,
-      nonRetryable: true,
-    });
-  }
-  return ownOnly({ ...options });
-}
-
-/**
- * The value, or a non-retryable failure if it is not a string.
- *
- * Workflow arguments are JSON and the annotation is erased. Without this, an array
- * in the text slot is applied as structured mutations (`write` is overloaded), and
- * anything without a `.length` throws a raw TypeError while the summary is built.
- */
-function requireText(value: unknown, label: string): string {
-  if (typeof value !== 'string') {
-    throw applicationFailure({
-      message: `${label} must be a string, got ${value === null ? 'null' : typeof value}`,
-      type: TYPE_BAD_OPTIONS,
-      nonRetryable: true,
-    });
-  }
-  return value;
 }
 
 /** How one status poll retries. Turned into a RetryPolicy by this package. */
@@ -168,11 +131,11 @@ const DEFAULT_WRITE_STATUS_RETRY = { attempts: 10, intervalMs: 1_000, maxInterva
  * something it always accepts.
  */
 function buildWriteStatusRetry(retry: WriteStatusRetry | undefined): RetryPolicy {
-  const opts = requireOptions(retry, 'writeStatusRetry');
+  const opts = retry ?? {};
   const attempts = opts.attempts ?? DEFAULT_WRITE_STATUS_RETRY.attempts;
   // `Infinity` is Temporal's own spelling of unlimited, and compiles away to unset.
   if (attempts !== Number.POSITIVE_INFINITY && (!Number.isInteger(attempts) || attempts < 1)) {
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `writeStatusRetry.attempts must be a positive integer or Infinity, got ${String(attempts)}`,
       type: TYPE_BAD_OPTIONS,
       nonRetryable: true,
@@ -184,30 +147,20 @@ function buildWriteStatusRetry(retry: WriteStatusRetry | undefined): RetryPolicy
     'writeStatusRetry.maxIntervalMs',
   );
   if (maxIntervalMs < intervalMs) {
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `writeStatusRetry.maxIntervalMs (${maxIntervalMs}) must not be below intervalMs (${intervalMs})`,
       type: TYPE_BAD_OPTIONS,
       nonRetryable: true,
     });
   }
   const types = opts.nonRetryableErrorTypes;
-  if (types !== undefined && (!Array.isArray(types) || types.some((t) => typeof t !== 'string'))) {
-    throw applicationFailure({
-      message: 'writeStatusRetry.nonRetryableErrorTypes must be an array of strings',
-      type: TYPE_BAD_OPTIONS,
-      nonRetryable: true,
-    });
-  }
-  // `ownOnly`, like every object handed to Temporal: the SDK reads the fields of
-  // this policy, and a plain literal would let a polluted prototype supply a
-  // `nonRetryableErrorTypes` the caller never set.
-  return ownOnly({
+  return {
     initialInterval: intervalMs,
     backoffCoefficient: 2,
     maximumInterval: maxIntervalMs,
     maximumAttempts: attempts,
     ...(types !== undefined ? { nonRetryableErrorTypes: [...types] } : {}),
-  });
+  };
 }
 
 export interface WorkflowXmemoryOptions {
@@ -260,19 +213,6 @@ export class WorkflowXmemory {
   };
 
   constructor(options: WorkflowXmemoryOptions = {}) {
-    // `?? {}` as well as the default: a default only applies to `undefined`, and
-    // workflow arguments arrive as JSON, where an omitted object is often `null`.
-    // Reading a field off that throws a raw TypeError inside workflow code, which
-    // Temporal retries as a Workflow Task — forever.
-    options = requireOptions(options, 'xmemoryForWorkflow');
-    const summarize = options.includeContentInSummary;
-    if (summarize !== undefined && typeof summarize !== 'boolean') {
-      throw applicationFailure({
-        message: `includeContentInSummary must be a boolean, got ${typeof summarize}`,
-        type: TYPE_BAD_OPTIONS,
-        nonRetryable: true,
-      });
-    }
     this.opts = {
       readTimeout: options.readTimeout ?? DEFAULT_TIMEOUTS.readMs,
       writeTimeout: options.writeTimeout ?? DEFAULT_TIMEOUTS.writeMs,
@@ -290,9 +230,6 @@ export class WorkflowXmemory {
   }
 
   async read(query: string, options: { readMode?: ReadMode; scope?: ReadScope } = {}): Promise<ReadOutput> {
-    query = requireText(query, 'read: query');
-    options = requireOptions(options, 'read');
-    durationMs(this.opts.readTimeout, 'read: timeout');
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.readTimeout,
       ...this.totalBound(),
@@ -315,9 +252,6 @@ export class WorkflowXmemory {
     text: string,
     options: { extractionLogic?: 'fast' | 'deep'; diffEngine?: boolean; structuredMutations?: readonly WriteMutation[] } = {},
   ): Promise<WriteOutput> {
-    text = requireText(text, 'write: text');
-    options = requireOptions(options, 'write');
-    durationMs(this.opts.writeTimeout, 'write: timeout');
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.writeTimeout,
       ...this.totalBound(),
@@ -342,9 +276,6 @@ export class WorkflowXmemory {
     text: string,
     options: { extractionLogic?: 'fast' | 'deep'; diffEngine?: boolean; structuredMutations?: readonly WriteMutation[] } = {},
   ): Promise<WriteStartOutput> {
-    text = requireText(text, 'writeAsyncStart: text');
-    options = requireOptions(options, 'writeAsyncStart');
-    durationMs(this.opts.writeStartTimeout, 'writeAsyncStart: timeout');
     const logic = options.extractionLogic;
     const acts = proxyActivities<ActivitySignatures>({
       startToCloseTimeout: this.opts.writeStartTimeout,
@@ -362,8 +293,6 @@ export class WorkflowXmemory {
 
   /** Poll a queued write once. The caller owns the overall wait. */
   async writeStatus(writeId: string): Promise<WriteStatusOutput> {
-    writeId = requireText(writeId, 'writeStatus: writeId');
-    durationMs(this.opts.writeStatusTimeout, 'writeStatus: timeout');
     return this.pollStatus(writeId, undefined);
   }
 
@@ -402,8 +331,6 @@ export class WorkflowXmemory {
    * sending only `structuredMutations` passes `''` and means it.
    */
   async writeDurable(text: string, options: WriteDurableOptions = {}): Promise<WriteStatusOutput> {
-    text = requireText(text, 'writeDurable: text');
-    options = requireOptions(options, 'writeDurable');
     // Everything below is validated before the enqueue: a rejected option must not
     // leave a queued write behind that nobody is waiting on.
     let delayMs = options.pollIntervalMs ?? 2_000;
@@ -418,7 +345,7 @@ export class WorkflowXmemory {
       // Below a millisecond Temporal truncates to zero, which hot-polls against its
       // timer floor; the upper bound is what setTimeout and the service can represent.
       if (!Number.isFinite(value) || value < 1 || value > MAX_DURATION_MS) {
-        throw applicationFailure({
+        throw ApplicationFailure.create({
           message: `writeDurable: ${name} must be between 1 and ${MAX_DURATION_MS}, got ${value}`,
           type: TYPE_BAD_OPTIONS,
           nonRetryable: true,
@@ -426,7 +353,7 @@ export class WorkflowXmemory {
       }
     }
     if (capMs < delayMs) {
-      throw applicationFailure({
+      throw ApplicationFailure.create({
         message: `writeDurable: maxPollIntervalMs (${capMs}) must not be below pollIntervalMs (${delayMs})`,
         type: TYPE_BAD_OPTIONS,
         nonRetryable: true,
@@ -445,7 +372,7 @@ export class WorkflowXmemory {
     let warnedHistory = false;
     let lastStatus: string | undefined;
     const maxWaitElapsed = (): ApplicationFailure =>
-      applicationFailure({
+      ApplicationFailure.create({
         message: `xmemory write ${start.writeId} did not complete within ${maxWaitMs}ms`,
         type: TYPE_WRITE_TIMEOUT,
         nonRetryable: true,
@@ -522,17 +449,15 @@ export class WorkflowXmemory {
 
   /** The configured total bound, as proxy options. Empty when none is set. */
   private totalBound(): { scheduleToCloseTimeout?: Duration } {
-    if (this.opts.totalTimeout === undefined) return {};
-    durationMs(this.opts.totalTimeout, 'totalTimeout');
-    return { scheduleToCloseTimeout: this.opts.totalTimeout };
+    return this.opts.totalTimeout === undefined ? {} : { scheduleToCloseTimeout: this.opts.totalTimeout };
   }
 
   /** The tighter of the loop's own bound and the caller's `totalTimeout`. */
   private pollBound(bound: Duration | undefined): { scheduleToCloseTimeout?: Duration } {
     if (bound === undefined) return this.totalBound();
     if (this.opts.totalTimeout === undefined) return { scheduleToCloseTimeout: bound };
-    const totalMs = durationMs(this.opts.totalTimeout, 'totalTimeout');
-    return { scheduleToCloseTimeout: Math.min(msToNumber(bound), totalMs) };
+    // Temporal already accepted `totalTimeout` when it scheduled the enqueue.
+    return { scheduleToCloseTimeout: Math.min(msToNumber(bound), msToNumber(this.opts.totalTimeout)) };
   }
 
   private summary(op: string, content: string, logic?: string): string {
@@ -547,7 +472,7 @@ function interpretStatus(status: WriteStatusOutput): WriteStatusOutput | null {
   if (value === STATUS_FAILED) {
     // The server's detail never leaves the worker: Temporal persists both Activity
     // results and failure details to cleartext history.
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `xmemory write ${status.writeId} failed`,
       type: TYPE_WRITE_FAILED,
       nonRetryable: true,
@@ -557,7 +482,7 @@ function interpretStatus(status: WriteStatusOutput): WriteStatusOutput | null {
   if (value === STATUS_NOT_FOUND) {
     // `writeAsync` is transactional, so a returned id is always queryable. A
     // not_found here means the write is genuinely gone.
-    throw applicationFailure({
+    throw ApplicationFailure.create({
       message: `xmemory write ${status.writeId} not found`,
       type: TYPE_WRITE_NOT_FOUND,
       nonRetryable: true,

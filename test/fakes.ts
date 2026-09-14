@@ -27,21 +27,13 @@ export class FakeXmemoryInstance implements XmemoryInstance {
   private stallRead = false;
   private malformedStatus = false;
   private statusWriteId: string | undefined;
-  private withoutErrorDetail = false;
   private emptyEnqueueId = false;
   private failStatusError: unknown;
-  private failStatusCount: number | undefined;
 
   constructor(private readonly readAnswer: unknown = 'the answer') {}
 
   /** Every `writeStatus` rejects, as a rate-limited backend would. */
   failStatusAlways(error: unknown): void {
-    this.failStatusError = error;
-  }
-
-  /** The first `n` polls reject, then the scripted sequence resumes. */
-  failStatusTimes(n: number, error: unknown): void {
-    this.failStatusCount = n;
     this.failStatusError = error;
   }
 
@@ -53,11 +45,6 @@ export class FakeXmemoryInstance implements XmemoryInstance {
   /** Answer an enqueue with an empty write id, as a malformed response would. */
   enqueueWithoutWriteId(): void {
     this.emptyEnqueueId = true;
-  }
-
-  /** Answer without an `error_detail` field at all, as a lean server would. */
-  omitErrorDetail(): void {
-    this.withoutErrorDetail = true;
   }
 
   /** Answer every status poll with a different write's id. */
@@ -121,14 +108,8 @@ export class FakeXmemoryInstance implements XmemoryInstance {
 
   async writeStatus(writeId: string, options?: Record<string, unknown>): Promise<never> {
     this.calls.push({ method: 'writeStatus', textOrQuery: writeId, options });
-    if (this.failStatusError !== undefined) {
-      if (this.failStatusCount === undefined) throw this.failStatusError;
-      if (this.failStatusCount > 0) {
-        this.failStatusCount -= 1;
-        throw this.failStatusError;
-      }
-    }
-    // A response with no fields of its own — a proxy error page, a truncated body.
+    if (this.failStatusError !== undefined) throw this.failStatusError;
+    // A response with no fields at all — a proxy error page, a truncated body.
     if (this.malformedStatus) return {} as never;
     const value = this.statusValues[Math.min(this.statusIndex, this.statusValues.length - 1)];
     this.statusIndex += 1;
@@ -136,9 +117,7 @@ export class FakeXmemoryInstance implements XmemoryInstance {
     return {
       write_id: this.statusWriteId ?? writeId,
       write_status: value,
-      // Omitted entirely when asked: an own `null` would shadow anything inherited,
-      // so a response that simply lacks the field is the case worth covering.
-      ...(this.withoutErrorDetail ? {} : { error_detail: errorDetail }),
+      error_detail: errorDetail,
       completed_at: null,
     } as never;
   }

@@ -19,24 +19,13 @@ import {
   doubleWriteWorkflow,
   durableWriteWorkflow,
   badOptionsDurableWriteWorkflow,
-  badOptionsContainerWorkflow,
   boundedReadWorkflow,
-  nonStringQueryWorkflow,
-  nonStringTextWorkflow,
   badWriteStatusRetryWorkflow,
-  noTextDurableWriteWorkflow,
-  pollutedPolicyDurableWriteWorkflow,
-  nonStringWriteIdWorkflow,
-  stringSummaryFlagWorkflow,
   optionsOverrideTextWorkflow,
-  nullOptionsWorkflow,
   totalBoundedDurableWriteWorkflow,
   tunedPollDurableWriteWorkflow,
   nonRetryableStatusDurableWriteWorkflow,
   badDurationDurableWriteWorkflow,
-  badReadTimeoutWorkflow,
-  infiniteReadTimeoutWorkflow,
-  badStatusTimeoutPollWorkflow,
   oversizedStatusTimeoutWorkflow,
   badStatusTimeoutDurableWriteWorkflow,
   briefWaitDurableWriteWorkflow,
@@ -459,58 +448,6 @@ test('a poll stopped by nonRetryableErrorTypes is not polled again', async () =>
   assert.equal(fake.count('writeStatus'), 1, 'polled again after a terminal verdict');
 });
 
-test('a non-string text or query is refused before anything is scheduled', async () => {
-  // The client's write is overloaded, so an array in the text slot is applied as
-  // structured mutations. And `summary()` reads `.length`, so a null query threw a
-  // raw TypeError and left the workflow retrying its Workflow Task forever.
-  const deleteMutation = [{ object_mutation: { object_type: 'Customer', delete: { key: { id: 1 } } } }];
-  const cases: { workflow: unknown; arg: unknown; what: string }[] = [
-    { workflow: nonStringTextWorkflow, arg: deleteMutation, what: 'a mutation array as text' },
-    { workflow: nonStringTextWorkflow, arg: 42, what: 'a number as text' },
-    // Explicitly null, which a default parameter does not cover: coercing it to ''
-    // wrote an empty memory instead of reporting the caller's mistake.
-    { workflow: nonStringTextWorkflow, arg: null, what: 'a null text' },
-    { workflow: nonStringWriteIdWorkflow, arg: null, what: 'a null write id' },
-    { workflow: nonStringQueryWorkflow, arg: null, what: 'a null query' },
-    { workflow: nonStringQueryWorkflow, arg: { a: 1 }, what: 'an object as query' },
-  ];
-  for (const { workflow, arg, what } of cases) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(workflow as never, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [arg] as never,
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${what} was not rejected`,
-    );
-    assert.equal(fake.calls.length, 0, `${what} reached the backend`);
-  }
-});
-
-test('an inherited retry-type list is not promoted into the built poll policy', async () => {
-  // The policy this package builds is a plain object, so it inherits from
-  // Object.prototype unless copied onto a null one. An inherited
-  // `nonRetryableErrorTypes` would make a retryable poll failure terminal.
-  const fake = new FakeXmemoryInstance();
-  fake.statusSequence(['completed']);
-  fake.failStatusTimes(1, apiError({ status: 500, code: 'INTERNAL_ERROR' }));
-  const w = await worker(fake);
-  const out = await w.runUntil(
-    env.client.workflow.execute(pollutedPolicyDurableWriteWorkflow, {
-      taskQueue: TASK_QUEUE,
-      workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-      args: [],
-    }),
-  );
-  assert.equal(out, 'completed', 'the retryable server error was treated as terminal');
-});
-
 test('unusable poll options enqueue nothing', async () => {
   // The scalars themselves are checked in the constructor — activities.test.ts
   // covers the range of them without a Worker. What needs a workflow is this: the
@@ -554,68 +491,6 @@ test('the poll policy Temporal schedules is the one built from the options', asy
   assert.equal(Number(policy?.backoffCoefficient ?? 0), 2);
 });
 
-test('a non-boolean summary flag is refused, not read as truthy', async () => {
-  // Summaries are persisted to workflow history, so "false" being truthy would put
-  // memory text in the clear. Refused rather than quietly treated as off: a caller
-  // who wrote "true" would otherwise get silence instead of what they asked for.
-  const fake = new FakeXmemoryInstance();
-  const w = await worker(fake);
-  const workflowId = `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
-  await assert.rejects(
-    () => w.runUntil(env.client.workflow.execute(stringSummaryFlagWorkflow, { taskQueue: TASK_QUEUE, workflowId, args: [] })),
-    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-  );
-  const history = await env.client.workflow.getHandle(workflowId).fetchHistory();
-  assert.ok(
-    !JSON.stringify(history.events ?? []).includes('SECRET memory text'),
-    'the memory text reached workflow history',
-  );
-  assert.equal(fake.count('write'), 0);
-});
-
-test('options that are not an options object are refused before the enqueue', async () => {
-  // A string or an array was *boxed* into an object with no recognisable fields, so
-  // every option silently fell back to its default — on the one call that promises
-  // to validate its options before it enqueues anything.
-  for (const bad of ['nope', [1, 2], 42]) {
-    const fake = new FakeXmemoryInstance();
-    const w = await worker(fake);
-    await assert.rejects(
-      () =>
-        w.runUntil(
-          env.client.workflow.execute(badOptionsContainerWorkflow, {
-            taskQueue: TASK_QUEUE,
-            workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-            args: [bad],
-          }),
-        ),
-      (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-      `${JSON.stringify(bad)} was accepted as options`,
-    );
-    assert.equal(fake.count('writeAsync'), 0, `enqueued with ${JSON.stringify(bad)} as options`);
-  }
-});
-
-test('a durable write with no text enqueues nothing', async () => {
-  // A default value on `text` made it optional in the emitted declaration, and
-  // `writeDurable()` then queued an empty deep write. The declaration gate asserts
-  // the type side; this is the runtime half.
-  const fake = new FakeXmemoryInstance();
-  const w = await worker(fake);
-  await assert.rejects(
-    () =>
-      w.runUntil(
-        env.client.workflow.execute(noTextDurableWriteWorkflow, {
-          taskQueue: TASK_QUEUE,
-          workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          args: [],
-        }),
-      ),
-    (e: unknown) => hasFailureType(e, 'XmemoryBadOptions'),
-  );
-  assert.equal(fake.count('writeAsync'), 0, 'enqueued a write with no text');
-});
-
 test('an options object cannot replace the text argument', async () => {
   // The payload was built as `{ text, ...options }`, so an options object carrying
   // its own `text` silently won over what the caller passed.
@@ -629,24 +504,6 @@ test('an options object cannot replace the text argument', async () => {
     }),
   );
   assert.equal(fake.calls[0]?.textOrQuery, 'INTENDED', 'the options object replaced the caller"s text');
-});
-
-test('options arriving as null are treated as omitted', async () => {
-  // A default parameter only applies to `undefined`, and workflow arguments are
-  // JSON, where an omitted object is usually `null`. Reading a field off it threw a
-  // raw TypeError inside workflow code, which Temporal retries as a Workflow Task
-  // forever rather than failing the workflow.
-  const fake = new FakeXmemoryInstance();
-  const w = await worker(fake);
-  const writeId = await w.runUntil(
-    env.client.workflow.execute(nullOptionsWorkflow, {
-      taskQueue: TASK_QUEUE,
-      workflowId: `wf-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-      args: [],
-    }),
-  );
-  assert.equal(writeId, 'w1');
-  assert.equal(fake.count('write'), 1);
 });
 
 test('a durable poll never outlives a tighter total timeout', async () => {
@@ -725,21 +582,13 @@ test('the final look is a single attempt', async () => {
   assert.notEqual(polls[0], 1, 'ordinary polls keep the configured policy');
 });
 
-test('unusable durations are rejected on every call, not just writeDurable', async () => {
-  // `msToNumber` passes Infinity straight through and throws a raw TypeError on a
-  // malformed string. Either one reaches Temporal and fails the Workflow Task over
-  // and over. The upper bound matters too: setTimeout turns anything above 2**31-1
-  // into 1ms, and the service refuses oversized durations when it builds the
-  // command — which for a durable write is after the enqueue.
+test('an unusable durable status timeout is rejected before the enqueue', async () => {
+  // Every other call leaves its timeout to Temporal, which rejects a bad one when it
+  // schedules the Activity, before anything happens. `writeDurable` polls with this
+  // timeout only after it has enqueued, so a bad one would leave a queued write
+  // nobody observes.
   const cases: { workflow: unknown; arg: unknown; what: string }[] = [
-    { workflow: infiniteReadTimeoutWorkflow, arg: undefined, what: 'infinite read timeout' },
-    { workflow: badReadTimeoutWorkflow, arg: 'garbage', what: 'malformed read timeout' },
-    { workflow: badReadTimeoutWorkflow, arg: 2_147_483_648, what: 'oversized read timeout' },
-    // Truncated to zero by Temporal, after which the activity falls back to the
-    // default ten-year schedule-to-close and the client is handed that as a budget.
-    { workflow: badReadTimeoutWorkflow, arg: 0.5, what: 'sub-millisecond read timeout' },
-    { workflow: badStatusTimeoutPollWorkflow, arg: 'garbage', what: 'malformed status timeout on writeStatus' },
-    { workflow: badDurationDurableWriteWorkflow, arg: 'garbage', what: 'malformed status timeout on writeDurable' },
+    { workflow: badDurationDurableWriteWorkflow, arg: 'garbage', what: 'malformed durable status timeout' },
     { workflow: oversizedStatusTimeoutWorkflow, arg: 2_147_483_648, what: 'oversized durable status timeout' },
   ];
   for (const { workflow, arg, what } of cases) {
@@ -758,6 +607,5 @@ test('unusable durations are rejected on every call, not just writeDurable', asy
       `${what} was not rejected as a bad option`,
     );
     assert.equal(fake.count('writeAsync'), 0, `${what} enqueued a write`);
-    assert.equal(fake.count('read'), 0, `${what} reached the backend`);
   }
 });

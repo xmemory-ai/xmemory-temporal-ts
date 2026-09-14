@@ -18,7 +18,7 @@ import type {
 import type { InstanceHolder } from './activities';
 import type { XmemoryConfig } from './config';
 import { activityBudgetMs, type DeadlineInfo, withDeadline } from './deadline';
-import { DEFAULT_CLIENT_MARGIN_MS, ownOnly } from './defaults';
+import { DEFAULT_CLIENT_MARGIN_MS, MAX_DURATION_MS } from './defaults';
 
 // Never capture our own writes, or capture recurses. This also skips a user
 // activity named `xmemory_*` — see the README's auto-capture section.
@@ -53,7 +53,8 @@ export function captureBudgetMs(remainingMs: number, ceilingMs: number, marginMs
   // time than the Activity has left. Fall back to a proportional reserve.
   const usable = Number.isFinite(marginMs) && marginMs > 0 ? remainingMs - marginMs : remainingMs * 0.8;
   if (usable <= 0 || !(ceilingMs > 0)) return null;
-  return Math.min(ceilingMs, usable);
+  // Capped like every client budget: a Node timer past it fires after 1ms.
+  return Math.min(ceilingMs, usable, MAX_DURATION_MS);
 }
 
 export function createAutoCaptureInterceptor(
@@ -61,7 +62,6 @@ export function createAutoCaptureInterceptor(
   config: XmemoryConfig,
   autoCapture: AutoCaptureConfig,
 ): ActivityInboundCallsInterceptor {
-  // Validated at plugin construction; this only resolves the default.
   const sampleRate = autoCapture.sampleRate ?? 1;
   const extractionLogic = autoCapture.extractionLogic ?? 'fast';
   const ceilingMs = autoCapture.captureTimeoutMs ?? 5000;
@@ -94,8 +94,8 @@ export function createAutoCaptureInterceptor(
     if (!text) return;
     if (typeof text !== 'string') {
       // `writeAsync` is overloaded on its first argument, so an array would be
-      // applied as mutations rather than remembered. Skipped, like every capture
-      // problem: it never affects the wrapped Activity.
+      // applied as structured mutations rather than remembered. Skipped, like every
+      // capture problem: it never affects the wrapped Activity.
       console.warn(`xmemory auto-capture skipped: project() returned a ${typeof text}, expected a string`);
       return;
     }
@@ -105,12 +105,7 @@ export function createAutoCaptureInterceptor(
     // Enqueue, not a full write: waiting for extraction would add its latency to
     // the activity's budget. Two bounds because `timeoutMs` stops at headers and
     // `withDeadline` caps the total.
-    // Null-prototype, like every object handed to the client: an inherited `scope`
-    // or `diffEngine` would otherwise ride along on the capture.
-    await withDeadline(
-      holder.get().writeAsync(text, ownOnly({ extractionLogic, timeoutMs: enqueueMs })),
-      enqueueMs,
-    );
+    await withDeadline(holder.get().writeAsync(text, { extractionLogic, timeoutMs: enqueueMs }), enqueueMs);
   }
 
   /**

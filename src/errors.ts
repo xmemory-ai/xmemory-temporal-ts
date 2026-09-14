@@ -13,7 +13,6 @@
 
 import { ApplicationFailure } from '@temporalio/common';
 import { XmemoryAPIError } from 'xmemory';
-import { applicationFailure, ownOnly } from './defaults';
 import {
   TYPE_AUTH_FAILED,
   TYPE_BAD_OPTIONS,
@@ -147,8 +146,7 @@ const KNOWN_CODES = new Set<string>([
 ]);
 
 function retryDelayMs(err: XmemoryAPIError): number | undefined {
-  // `ownOnly`: an inherited `retry_after_seconds` would be a hint nobody sent.
-  const detail = ownOnly({ ...((err.details ?? {}) as Record<string, unknown>) });
+  const detail = (err.details ?? {}) as Record<string, unknown>;
   // Each source judged on its own: preferring the header and validating afterwards
   // discarded a good structured hint whenever the header was unusable.
   for (const hint of [err.retryAfter, detail.retry_after_seconds]) {
@@ -168,8 +166,7 @@ function usableDelayMs(hint: unknown): number | undefined {
 }
 
 function quotaVerdict(err: XmemoryAPIError): { type: string; retryable: boolean } {
-  // Own properties only: an inherited `kind` would promote a terminal quota failure.
-  const detail = ownOnly({ ...((err.details ?? {}) as Record<string, unknown>) });
+  const detail = (err.details ?? {}) as Record<string, unknown>;
   const kind = detail.kind;
   // A daily window resets within hours and is worth retrying; a monthly one is not.
   // An unknown kind falls back to non-retryable.
@@ -195,7 +192,7 @@ function build(
   status: number | null = null,
   delayMs?: number,
 ): ApplicationFailure {
-  return applicationFailure({
+  return ApplicationFailure.create({
     message: MESSAGES[type] ?? 'xmemory request failed',
     type,
     nonRetryable: !retryable,
@@ -217,8 +214,6 @@ function build(
  * not reach here.
  */
 function isNetworkError(err: unknown): boolean {
-  // `Object.hasOwn`, not a plain read: an inherited `cause` would make a programming
-  // TypeError look like a transient blip.
   return err instanceof TypeError && Object.hasOwn(err, 'cause');
 }
 
