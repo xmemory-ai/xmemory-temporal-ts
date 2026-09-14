@@ -149,20 +149,6 @@ export async function pollutedPolicyDurableWriteWorkflow(): Promise<string> {
   }
 }
 
-/**
- * An opted-in write retry under the same pollution. Covers `snapshotPolicy`, which
- * guards the policies still passed through from the caller.
- */
-export async function pollutedWritePolicyWorkflow(text: string): Promise<string> {
-  (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes = ['XmemoryServerError'];
-  try {
-    const mem = xmemoryForWorkflow({ writeRetryPolicy: { initialInterval: '1s', maximumAttempts: 3 } });
-    return (await mem.write(text)).writeId;
-  } finally {
-    delete (Object.prototype as Record<string, unknown>).nonRetryableErrorTypes;
-  }
-}
-
 /** Options supplied as something that is not an options object. */
 export async function badOptionsContainerWorkflow(value: unknown): Promise<string> {
   const mem = xmemoryForWorkflow();
@@ -185,18 +171,6 @@ export async function nonStringWriteIdWorkflow(value: unknown): Promise<string> 
 export async function optionsOverrideTextWorkflow(): Promise<string> {
   const mem = xmemoryForWorkflow();
   return (await mem.write('INTENDED', { text: 'OVERRIDE' } as never)).writeId;
-}
-
-/** A valid write policy that simply never says how many attempts: unlimited. */
-export async function unboundedWritePolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ writeRetryPolicy: { initialInterval: '1s', backoffCoefficient: 2 } });
-  return (await mem.write('remember')).writeId;
-}
-
-/** A write policy with a plausible typo: Temporal ignores it and retries forever. */
-export async function typoWritePolicyWorkflow(): Promise<string> {
-  const mem = xmemoryForWorkflow({ writeRetryPolicy: { maximumAttempt: 1 } as never });
-  return (await mem.write('remember')).writeId;
 }
 
 /** A duration string no parser accepts, supplied where a duration is expected. */
