@@ -38,12 +38,12 @@
     "xmemory": "^3.8.3"
   },
   "devDependencies": {
-    "@temporalio/activity": "~1.20.0",
-    "@temporalio/client": "~1.20.0",
-    "@temporalio/common": "~1.20.0",
-    "@temporalio/testing": "~1.20.0",
-    "@temporalio/worker": "~1.20.0",
-    "@temporalio/workflow": "~1.20.0",
+    "@temporalio/activity": "~1.24.0",
+    "@temporalio/client": "~1.24.0",
+    "@temporalio/common": "~1.24.0",
+    "@temporalio/testing": "~1.24.0",
+    "@temporalio/worker": "~1.24.0",
+    "@temporalio/workflow": "~1.24.0",
     "@types/ms": "^2.1.0",
     "@types/node": "^22",
     "tsx": "^4.21.0",
@@ -60,11 +60,11 @@
     "prepare": "npm run build"
   },
   "peerDependencies": {
-    "@temporalio/activity": "~1.20.0",
-    "@temporalio/client": "~1.20.0",
-    "@temporalio/common": "~1.20.0",
-    "@temporalio/worker": "~1.20.0",
-    "@temporalio/workflow": "~1.20.0"
+    "@temporalio/activity": "~1.24.0",
+    "@temporalio/client": "~1.24.0",
+    "@temporalio/common": "~1.24.0",
+    "@temporalio/worker": "~1.24.0",
+    "@temporalio/workflow": "~1.24.0"
   },
   "//peer": "The Worker plugin contract is the host SDK's, and a plugin that bundles its own copy would run against a second, different Temporal runtime \u2014 the host's Worker would not even recognise it. Declared as peers so one SDK is installed, and kept in devDependencies for building and testing here."
 }
