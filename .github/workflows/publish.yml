@@ -190,15 +190,21 @@ jobs:
     environment: npm
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # Trusted Publishing + npm provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # No `registry-url`: it writes an .npmrc that authenticates with NODE_AUTH_TOKEN,
+      # and publishing here goes through Trusted Publishing, not a token.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+      - name: Install an npm that supports Trusted Publishing
+        # Node 22 ships npm 10, which never asks for the OIDC token; Trusted
+        # Publishing needs 11.5.1 or newer. Pinned so two runs publish with the
+        # same tooling.
+        run: npm install --global --ignore-scripts npm@11.20.0
       - name: Take the artifact `pack` produced
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -206,15 +212,15 @@ jobs:
           path: pack
       - name: Publish to npm
         # The tarball itself, so what is published is what was built and checked.
+        # Trusted Publishing, so no token is stored: npm's trusted publisher for
+        # @xmemory/temporal names this repository, publish.yml and the `npm`
+        # environment, so renaming any of them breaks publishing.
         # `--provenance` requires id-token: write and a public source repo.
         # `--access public` is required for a scoped (@xmemory) package.
         # --ignore-scripts: nothing in this job should execute package code.
         env:
           VERSION: ${{ needs.pack.outputs.version }}
           DIST_TAG: ${{ needs.pack.outputs.dist_tag }}
-          # TOKEN: set the NPM_TOKEN secret (a granular access token) before the
-          # first release.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: pack
         run: |
           # The same digest `pack` recorded, checked once more in the job that holds
