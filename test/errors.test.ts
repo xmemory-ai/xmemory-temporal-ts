@@ -20,6 +20,13 @@ const CASES: Case[] = [
   { label: '408', args: { status: 408 }, type: errors.TYPE_SERVER_ERROR, nonRetryable: false },
   { label: 'transport', args: { status: undefined }, type: errors.TYPE_UNAVAILABLE, nonRetryable: false },
   { label: 'internal', args: { status: 500, code: 'INTERNAL_ERROR' }, type: errors.TYPE_SERVER_ERROR, nonRetryable: false },
+  // What a write answers when the model provider refuses xmemory's own credentials, account or endpoint.
+  {
+    label: 'service-unavailable',
+    args: { status: 503, code: 'SERVICE_UNAVAILABLE' },
+    type: errors.TYPE_SERVER_ERROR,
+    nonRetryable: false,
+  },
   { label: 'rate', args: { status: 429, code: 'RATE_LIMITED' }, type: errors.TYPE_RATE_LIMITED, nonRetryable: false },
   {
     label: 'quota-daily',
