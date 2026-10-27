@@ -8,10 +8,6 @@ Like all API calls, xmemory reads and writes are non-deterministic. In a [Tempor
 
 The code in this guide is based on the [examples in the xmemory-temporal-ts repository](https://github.com/xmemory-ai/xmemory-temporal-ts/tree/main/examples).
 
-> **Preview**
->
->    The plugin is under review for Temporal's AI Partner Ecosystem and is not yet on npm. Install it from the [source repository](https://github.com/xmemory-ai/xmemory-temporal-ts); the npm release (`@xmemory/temporal`) follows once the review completes.
-
 ## Prerequisites
 
 - This guide assumes you are already familiar with xmemory. If you aren't, refer to the [xmemory documentation](https://xmemory.ai) for more details.
@@ -25,10 +21,10 @@ Workers are the compute layer of a Temporal Application. They are responsible fo
 
 Follow the steps below to configure your Worker.
 
-1. Install the `@xmemory/temporal` package (from source until the npm release).
+1. Install the [`@xmemory/temporal`](https://www.npmjs.com/package/@xmemory/temporal) package from npm.
 
    ```bash
-   npm install github:xmemory-ai/xmemory-temporal-ts @temporalio/worker @temporalio/client
+   npm install @xmemory/temporal @temporalio/worker @temporalio/client
    ```
 
 2. Provide your xmemory API key through the environment. The plugin reads it by name, so it is never serialized into Workflow history.
